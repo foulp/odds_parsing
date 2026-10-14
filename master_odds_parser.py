@@ -14,13 +14,28 @@ from gspread_dataframe import set_with_dataframe
 from gspread.utils import rowcol_to_a1
 from playwright.sync_api import sync_playwright
 
+import logging
+
+# Configuration du fichier de log
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("scraping.log", encoding="utf-8"),
+        logging.StreamHandler() # Garde aussi l'affichage dans le terminal
+    ]
+)
+
+# ==========================================
+# 1. MODULE GOOGLE SHEETS
+# ==========================================
 # ==========================================
 # 1. MODULE GOOGLE SHEETS
 # ==========================================
 def export_to_google_sheets(df, json_key_path, spreadsheet_name, sheet_name="Feuille 1"):
-    print(f"\n[GSHEETS] Connexion avec {json_key_path} pour l'onglet '{sheet_name}'...")
+    logging.info(f"\n[GSHEETS] Connexion avec {json_key_path} pour l'onglet '{sheet_name}'...")
     if df.empty:
-        print("[GSHEETS] Le DataFrame est vide, annulation de l'export.")
+        logging.info("[GSHEETS] Le DataFrame est vide, annulation de l'export.")
         return
         
     df_export = df.copy()
@@ -34,12 +49,10 @@ def export_to_google_sheets(df, json_key_path, spreadsheet_name, sheet_name="Feu
         try:
             worksheet = sh.worksheet(sheet_name)
         except gspread.exceptions.WorksheetNotFound:
-            print(f"[GSHEETS] L'onglet '{sheet_name}' n'existe pas. Création en cours...")
+            logging.info(f"[GSHEETS] L'onglet '{sheet_name}' n'existe pas. Création en cours...")
             worksheet = sh.add_worksheet(title=sheet_name, rows="1000", cols="20")
         
-        # --- CORRECTION DU BUG HEADER ---
         donnees_existantes = worksheet.get_all_values()
-        # On ne garde que les lignes qui contiennent au moins un caractère
         lignes_non_vides = [row for row in donnees_existantes if any(str(cell).strip() for cell in row)]
         
         est_vide = len(lignes_non_vides) == 0
@@ -52,7 +65,7 @@ def export_to_google_sheets(df, json_key_path, spreadsheet_name, sheet_name="Feu
             
         total_lignes = ligne_depart + len(df_export) - (1 if not est_vide else 0)
         
-        print("[GSHEETS] Application de la mise en forme et des filtres...")
+        logging.info("[GSHEETS] Application de la mise en forme et des filtres...")
 
         worksheet.freeze(rows=1)
 
@@ -65,26 +78,69 @@ def export_to_google_sheets(df, json_key_path, spreadsheet_name, sheet_name="Feu
         plage_totale = f"A1:{lettre_max}{total_lignes}"
         worksheet.set_basic_filter(plage_totale)
 
-        # Formatage des nombres
+        # 1. Formatage des nombres et pourcentages
         for col_idx, col_name in enumerate(df_export.columns):
             col_lettre = rowcol_to_a1(1, col_idx + 1)[:-1]
             plage_colonne = f"{col_lettre}2:{col_lettre}{total_lignes}"
 
             if col_name in ["Cote PMU", "Cote Wina", "Cote Betclic"]:
                 worksheet.format(plage_colonne, {"numberFormat": {"type": "NUMBER", "pattern": "0.00"}})
+            # NOUVEAU : Format pourcentage sans décimal
+            elif col_name == "Ratio (PMU/Wina)":
+                worksheet.format(plage_colonne, {"numberFormat": {"type": "PERCENT", "pattern": "0%"}})
 
-        # Ajustement des colonnes
+        # 2. Requêtes API en lot (Largeur de colonnes + Dégradés de couleurs)
         body = {
-            "requests": [{"autoResizeDimensions": {"dimensions": {"sheetId": worksheet.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": len(df_export.columns)}}}]
+            "requests": [
+                # Ajustement de la largeur des colonnes
+                {"autoResizeDimensions": {"dimensions": {"sheetId": worksheet.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": len(df_export.columns)}}}
+            ]
         }
+        
+        # NOUVEAU : Mise en forme conditionnelle par taille de combinaison
+        if 'Ratio (PMU/Wina)' in df_export.columns and 'Taille Combi' in df_export.columns:
+            ratio_col_index = df_export.columns.get_loc('Ratio (PMU/Wina)')
+            
+            # Calcul de la vraie ligne de départ (index Google Sheets commence à 0)
+            data_start_row = ligne_depart + (1 if est_vide else 0) - 1
+            
+            def create_gradient_request(start_r, end_r, col_idx):
+                return {
+                    "addConditionalFormatRule": {
+                        "rule": {
+                            "ranges": [{"sheetId": worksheet.id, "startRowIndex": start_r, "endRowIndex": end_r, "startColumnIndex": col_idx, "endColumnIndex": col_idx + 1}],
+                            "gradientRule": {
+                                "minpoint": {"color": {"red": 0.9, "green": 0.5, "blue": 0.5}, "type": "MIN"},      # Rouge pastel
+                                "midpoint": {"color": {"red": 1.0, "green": 1.0, "blue": 1.0}, "type": "PERCENTILE", "value": "50"}, # Blanc au milieu (lisibilité)
+                                "maxpoint": {"color": {"red": 0.5, "green": 0.85, "blue": 0.5}, "type": "MAX"}     # Vert pastel
+                            }
+                        },
+                        "index": 0 # Ajoute la règle en haut de la pile
+                    }
+                }
+            
+            group_start = 0
+            current_taille = df_export.iloc[0]['Taille Combi'] if not df_export.empty else None
+            
+            for i in range(len(df_export)):
+                taille = df_export.iloc[i]['Taille Combi']
+                # Si on change de taille de combinaison, on clôture le groupe précédent et on crée son dégradé
+                if taille != current_taille:
+                    body["requests"].append(create_gradient_request(data_start_row + group_start, data_start_row + i, ratio_col_index))
+                    current_taille = taille
+                    group_start = i
+            
+            # N'oublions pas le dernier groupe de la boucle
+            if not df_export.empty:
+                body["requests"].append(create_gradient_request(data_start_row + group_start, data_start_row + len(df_export), ratio_col_index))
+
+        # Envoi de la requête globale (mise à l'échelle + tous les dégradés)
         sh.batch_update(body)
 
-        print(f"[GSHEETS] Succès : {len(df_export)} lignes ajoutées à '{spreadsheet_name} -> {sheet_name}'.")
+        logging.info(f"[GSHEETS] Succès : {len(df_export)} lignes ajoutées à '{spreadsheet_name} -> {sheet_name}'.")
         
-    except gspread.exceptions.SpreadsheetNotFound:
-        print(f"[ERREUR] Le fichier '{spreadsheet_name}' est introuvable.")
     except Exception as e:
-        print(f"[ERREUR] Échec de l'exportation : {type(e).__name__} - {e}")
+        logging.error(f"[ERREUR] Échec de l'exportation : {type(e).__name__} - {e}")
 
 
 # ==========================================
@@ -124,7 +180,6 @@ def get_pmu_players_dict(event_id, market_label):
                         "home": teams_order.get(team_id),
                         "Taille Combi": 1,
                         "Joueurs": player_name,
-                        "Cotes Solos PMU": str(cote_solo),
                         "outcome_id": str(outcome_id),
                         "Cote PMU": cote_solo
                     }
@@ -157,18 +212,18 @@ def nettoyer_nom(nom):
 # ==========================================
 # 4. MODULE MASTER (WINA + CRÉATION PMU COMBOS)
 # ==========================================
-def run_master_wina_and_pmu(url_match, event_id_pmu, df_pmu_simples, tailles_combi, limit, cote_out, ratio_min, name_match_score=85):
+def run_master_wina_and_pmu(url_match, event_id_pmu, df_pmu_simples, tailles_combi, limit, cote_out, ratio_min, name_match_score=85, headless=True):
     """
     Extrait les cotes simples Wina, filtre les joueurs intéressants (Cote < limite OU Value Wina > 115%),
     génère les combos PMU sur cette base réduite, et lance le MyMatch Winamax dessus.
     """
-    print(f"\n--- DÉMARRAGE WINAMAX & GÉNÉRATION CIBLÉE ---")
+    logging.info(f"\n--- DÉMARRAGE WINAMAX & GÉNÉRATION CIBLÉE ---")
     df_wina_results = []
     mapping_pmu_to_wina = {} 
     ratio_dict = {}
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True) # Mettez False si vous voulez voir l'action
+        browser = p.chromium.launch(headless=headless) # Mettez False si vous voulez voir l'action
         page = browser.new_page()
         page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "font", "media"] else route.continue_())
         page.goto(url_match)
@@ -182,16 +237,25 @@ def run_master_wina_and_pmu(url_match, event_id_pmu, df_pmu_simples, tailles_com
         section = page.locator("div").filter(has=page.get_by_text("Joueur décisif", exact=True)).filter(has=page.locator("div.bet-group-template")).last
         tableaux = section.locator("div.bet-group-template")
 
+        # On masque les bannières gênantes via JavaScript
+        page.evaluate("document.querySelectorAll('#tarteaucitronRoot, #warning-anj-risks').forEach(el => el.style.display = 'none');")
+        
+        # On force la page à descendre sur la section entière avant de commencer
+        section.scroll_into_view_if_needed()
+        time.sleep(0.5)
+        
+        # 1. VOTRE BOUCLE D'OUVERTURE D'ORIGINE
         for i in range(tableaux.count()):
             btn_plus = tableaux.nth(i).locator("xpath=..").get_by_text("Plus de sélections")
             if btn_plus.count() > 0 and btn_plus.first.is_visible():
-                btn_plus.first.click()
-                time.sleep(0.5)
+                btn_plus.first.scroll_into_view_if_needed() # Scroll sur le bouton spécifique
+                btn_plus.first.click(force=True)
+                time.sleep(1.5) # <- La SEULE correction vitale : on attend 1.5s au lieu de 0.5s
 
         dict_boutons = {} 
         wina_simples_bruts = []
         
-        # A. Extraction des simples Winamax
+        # A. VOTRE EXTRACTION D'ORIGINE (Équipe 1 puis Équipe 2)
         for i in range(tableaux.count()):
             parent_bloc = tableaux.nth(i).locator("xpath=..")
             is_home = 1 if i == 0 else 0
@@ -202,31 +266,46 @@ def run_master_wina_and_pmu(url_match, event_id_pmu, df_pmu_simples, tailles_com
             if noms_elems.count() > 0:
                 for j in range(noms_elems.count()):
                     nom = noms_elems.nth(j).inner_text().strip()
-                    dict_boutons[nom] = btn_elems.nth(j * 3 + 2)
-                    wina_simples_bruts.append({"home": is_home, "Nom": nom, "Cote": float(val_elems.nth(j * 3 + 2).inner_text().replace(',', '.'))})
+                    try:
+                        dict_boutons[nom] = btn_elems.nth(j * 3 + 2)
+                        wina_simples_bruts.append({
+                            "home": is_home, 
+                            "Nom": nom, 
+                            "Cote": float(val_elems.nth(j * 3 + 2).inner_text().replace(',', '.'))
+                        })
+                    except Exception:
+                        pass
 
-        # B. Matching et calcul du Ratio (Value)
-        print("Analyse des Ratios PMU/Wina...")
+        # B. MATCHING PMU -> WINA (Filtré pour des logs propres)
+        logging.info("Analyse des correspondances PMU -> Winamax...")
         for home_status in [1, 0]:
             pmu_names = df_pmu_simples[df_pmu_simples['home'] == home_status]['Joueurs'].tolist()
             wina_names = [x["Nom"] for x in wina_simples_bruts if x["home"] == home_status]
             wina_clean = [nettoyer_nom(n) for n in wina_names]
             
+            if not wina_clean:
+                continue
+                
             for pmu_name in pmu_names:
                 best_match, score = process.extractOne(nettoyer_nom(pmu_name), wina_clean)
                 wina_original = wina_names[wina_clean.index(best_match)]
+                
                 if score >= name_match_score:
-                    print(f"{wina_original}({best_match}) matched {pmu_name}({nettoyer_nom(pmu_name)}) with score of {score}")
-                    wina_original = wina_names[wina_clean.index(best_match)]
+                    logging.info(f"  [MATCH OK] PMU: '{pmu_name}' <---> Wina: '{wina_original}' (Score: {score})")
                     mapping_pmu_to_wina[pmu_name] = wina_original
-                    # Ajout de la cote simple trouvée directement avec la clé universelle PMU
                     cote_simple = next(x["Cote"] for x in wina_simples_bruts if x["Nom"] == wina_original)
                     df_wina_results.append({"Taille Combi": 1, "Joueurs": pmu_name, "Cote Wina": cote_simple})
+                    ratio_dict[pmu_name] = df_pmu_simples.loc[df_pmu_simples['Joueurs'] == pmu_name, 'Cote PMU'].values[0] / cote_simple
+                
+                elif score >= 65:
+                    # Doute légitime (orthographe différente)
+                    logging.warning(f"  [!] Doute sur le match : {pmu_name} <-> {wina_original} (Score: {score})")
                 else:
-                    print(f"WARNING! {wina_original}({best_match}) matched {pmu_name}({nettoyer_nom(pmu_name)}) with low score of {score}")
+                    # Joueur absent, on n'affiche plus un "Warning" absurde
+                    logging.info(f"  [ABSENT] PMU: '{pmu_name}' introuvable sur Winamax.")
 
         # C. SMART PRUNING : Génération des combinaisons PMU
-        print("\n[SMART PRUNING] Filtrage des joueurs (Cote < limite OU Ratio > ratio_min)...")
+        logging.info("\n[SMART PRUNING] Filtrage des joueurs (Cote < limite OU Ratio > ratio_min)...")
         valid_combos = []
         for home_status in [1, 0]:
             team_idx = df_pmu_simples[df_pmu_simples['home'] == home_status].index.tolist()
@@ -246,7 +325,7 @@ def run_master_wina_and_pmu(url_match, event_id_pmu, df_pmu_simples, tailles_com
                 for combo in combinations(eligible_idx, taille):
                     valid_combos.append(combo)
                     
-        print(f"-> {len(valid_combos)} combinaisons ultra-ciblées générées.")
+        logging.info(f"-> {len(valid_combos)} combinaisons ultra-ciblées générées.")
 
         # D. Récupération des cotes PMU sur ces combinaisons (API)
         pmu_combos_data = []
@@ -271,37 +350,45 @@ def run_master_wina_and_pmu(url_match, event_id_pmu, df_pmu_simples, tailles_com
         df_pmu_final = pd.concat([df_pmu_simples.drop(columns=['outcome_id']), df_pmu_combos], ignore_index=True)
 
         # E. Lancement du MyMatch Winamax sur ce pool restreint
-        print("\nCalcul des combinaisons ciblées sur Winamax (MyMatch)...")
+        nom_match_log = df_pmu_simples.iloc[0]['Match']
+        logging.info(f"[{nom_match_log}] Calcul des combinaisons ciblées sur Winamax...")
         panier = page.locator("div[data-testid='sticky-wrap']")
 
         if not df_pmu_combos.empty:
             for i, ( _, row) in enumerate(df_pmu_combos.iterrows()):
-                print(f"- Computing {i+1} / {len(df_pmu_combos)} : {row['Joueurs']}")
                 cle_universelle_pmu = row['Joueurs']
-                joueurs_pmu_list = cle_universelle_pmu.split(' - ')
+                logging.info(f"[{nom_match_log}] Computing {i+1} / {len(df_pmu_combos)} : {cle_universelle_pmu}")
                 
+                joueurs_pmu_list = cle_universelle_pmu.split(' - ')
                 joueurs_wina_list = [mapping_pmu_to_wina.get(j) for j in joueurs_pmu_list]
-                if None in joueurs_wina_list: continue
+                
+                # Si l'un des joueurs n'a pas été matché (score thefuzz insuffisant), on saute
+                if None in joueurs_wina_list: 
+                    continue
                     
                 try:
+                    # Masquage des bannières au cas où (très rapide)
+                    page.evaluate("document.querySelectorAll('#tarteaucitronRoot, #warning-anj-risks').forEach(el => el.style.display = 'none');")
+                    
+                    # 1. Sélection des joueurs (force=True pour ignorer le panier superposé)
                     for j_wina in joueurs_wina_list:
                         dict_boutons[j_wina].scroll_into_view_if_needed()
-                        dict_boutons[j_wina].click()
-                        time.sleep(0.2)
+                        dict_boutons[j_wina].click(force=True) # <-- CORRECTION MAJEURE
+                        time.sleep(0.3)
                     
-                    time.sleep(0.2) 
-                    
-                        
-                    # Ciblage direct de la classe HTML contenant la cote
-                    element_cote = panier.locator(".odds-indicator-value")
-                        
-                    if element_cote.count() > 0 and element_cote.first.is_visible():
-                        texte_cote = element_cote.first.inner_text().strip()
-                        try:
-                            match_cote = float(texte_cote.replace(',', '.'))
-                        except ValueError:
-                            pass
-                    print(match_cote)
+                    # 2. Boucle de lecture sécurisée
+                    match_cote = None
+                    for _ in range(5):
+                        time.sleep(0.5)
+                        element_cote = panier.locator(".odds-indicator-value")
+                        if element_cote.count() > 0 and element_cote.first.is_visible():
+                            texte_cote = element_cote.first.inner_text().strip()
+                            try:
+                                match_cote = float(texte_cote.replace(',', '.'))
+                                break
+                            except ValueError:
+                                pass
+                            
                     if match_cote:
                         df_wina_results.append({
                             "Taille Combi": len(joueurs_pmu_list), 
@@ -309,21 +396,28 @@ def run_master_wina_and_pmu(url_match, event_id_pmu, df_pmu_simples, tailles_com
                             "Cote Wina": match_cote
                         })
                     else:
-                        print(f"    [!] Échec lecture cote Wina pour : {cle_universelle_pmu}")
+                        logging.warning(f"[{nom_match_log}] Échec lecture cote Wina pour : {cle_universelle_pmu}")
 
-                    if panier.locator("svg[viewBox='0 0 20 20']").first.is_visible():
-                        panier.locator("svg[viewBox='0 0 20 20']").first.click()
-                        time.sleep(0.2)
+                    # 3. Vidage du panier (force=True)
+                    corbeille = panier.locator("svg[viewBox='0 0 20 20']").first
+                    if corbeille.is_visible():
+                        corbeille.click(force=True)
+                        time.sleep(0.3)
                     else:
-                        for j_wina in joueurs_wina_list: dict_boutons[j_wina].click()
+                        for j_wina in joueurs_wina_list: 
+                            dict_boutons[j_wina].click(force=True)
 
-                except Exception:
+                except Exception as e:
+                    logging.error(f"[{nom_match_log}] Erreur sur combo {cle_universelle_pmu}: {e}")
+                    # En cas de crash total, on vide le panier via JS et on recharge
                     page.evaluate("window.localStorage.clear(); sessionStorage.clear();")
                     page.reload()
                     time.sleep(3)
-                    for i in range(tableaux.count()):
-                        btn_plus = tableaux.nth(i).locator("xpath=..").get_by_text("Plus de sélections")
-                        if btn_plus.count() > 0 and btn_plus.first.is_visible(): btn_plus.first.click()
+                    page.evaluate("document.querySelectorAll('#tarteaucitronRoot, #warning-anj-risks').forEach(el => el.style.display = 'none');")
+                    for j in range(tableaux.count()):
+                        btn_plus = tableaux.nth(j).locator("xpath=..").get_by_text("Plus de sélections")
+                        if btn_plus.count() > 0 and btn_plus.first.is_visible(): 
+                            btn_plus.first.click(force=True)
 
         browser.close()
     return df_pmu_final, pd.DataFrame(df_wina_results)
@@ -332,13 +426,13 @@ def run_master_wina_and_pmu(url_match, event_id_pmu, df_pmu_simples, tailles_com
 # ==========================================
 # 5. MODULE BETCLIC
 # ==========================================
-def run_betclic_extraction(url_match, df_pmu):
-    print(f"\n--- DÉMARRAGE BETCLIC ---")
+def run_betclic_extraction(url_match, df_pmu, headless=True):
+    logging.info(f"\n--- DÉMARRAGE BETCLIC ---")
     df_bc_results = []
     mapping_bc_to_pmu = {} 
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=headless)
         page = browser.new_page()
         page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "font", "media"] else route.continue_())
         page.goto(url_match)
@@ -376,11 +470,11 @@ def run_betclic_extraction(url_match, df_pmu):
                 best_match, score = process.extractOne(nettoyer_nom(bc_joueur["Nom"]), pmu_clean)
                 pmu_original = pmu_names[pmu_clean.index(best_match)]
                 if score >= 90:
-                    print(f"{bc_joueur['Nom']}({nettoyer_nom(bc_joueur["Nom"])}) matched {pmu_original}({best_match}) with score of {score}")
+                    logging.info(f"{bc_joueur['Nom']}({nettoyer_nom(bc_joueur["Nom"])}) matched {pmu_original}({best_match}) with score of {score}")
                     mapping_bc_to_pmu[bc_joueur["Nom"]] = pmu_original
                     df_bc_results.append({"Taille Combi": 1, "Joueurs": pmu_original, "Cote Betclic": bc_joueur["Cote"]})
                 else:
-                    print(f"WARNING! {bc_joueur['Nom']}({nettoyer_nom(bc_joueur["Nom"])}) matched {pmu_original}({best_match}) with score of {score}")
+                    logging.info(f"WARNING! {bc_joueur['Nom']}({nettoyer_nom(bc_joueur["Nom"])}) matched {pmu_original}({best_match}) with score of {score}")
 
         # Extraction Duos
         try:
@@ -423,23 +517,37 @@ def run_betclic_extraction(url_match, df_pmu):
 # 6. EXECUTION PRINCIPALE
 # ==========================================
 
-def process_single_match(event_pmu, event_wina, url_betclic, args, gsheet_credentials, delay):
+def process_single_match(event_pmu, event_wina, url_betclic, titulaires, args, gsheet_credentials, delay):
     """Encapsule la logique d'un match avec un délai de démarrage anti-bot."""
     # Désynchronisation initiale pour éviter les pics de requêtes
     time.sleep(delay)
     
     try:
-        print(f"\n[{event_pmu}] Démarrage du traitement...")
+        logging.info(f"[{event_pmu}] Démarrage du traitement...")
         url_wina_full = f"https://www.winamax.fr/paris-sportifs/match/{event_wina}"
         
-        # 1. PMU
+        # 1. Base PMU
         df_pmu_simples = get_pmu_players_dict(event_pmu, "Buteur ou passeur décisif")
         if df_pmu_simples.empty:
-            print(f"[{event_pmu}] Fin : Pas de données PMU.")
+            logging.info(f"[{event_pmu}] Fin : Pas de données PMU.")
             return
 
+        # --- NOUVEAU : FILTRE PAR COLONNE CSV ---
+        if titulaires:
+            import re
+            nb_avant = len(df_pmu_simples)
+            # re.escape protège les noms qui auraient des caractères spéciaux
+            pattern = '|'.join([re.escape(t) for t in titulaires])
+            masque = df_pmu_simples['Joueurs'].str.contains(pattern, case=False, na=False)
+            df_pmu_simples = df_pmu_simples[masque].reset_index(drop=True)
+            logging.info(f"[{event_pmu}] -> {len(df_pmu_simples)} titulaires conservés sur {nb_avant}.")
+            
+            if df_pmu_simples.empty:
+                logging.info(f"[{event_pmu}] Aucun joueur ne correspond à la liste des titulaires. Fin.")
+                return
+
         # 2. Winamax + PMU Combos
-        df_pmu_final, df_wina = run_master_wina_and_pmu(url_wina_full, event_pmu, df_pmu_simples, args.tailles, args.limit, args.cote_out, args.ratio_min, args.name_match_score)
+        df_pmu_final, df_wina = run_master_wina_and_pmu(url_wina_full, event_pmu, df_pmu_simples, args.tailles, args.limit, args.cote_out, args.ratio_min, args.name_match_score, args.headless)
         
         df_final = pd.merge(df_pmu_final, df_wina, on=['Taille Combi', 'Joueurs'], how='left') if not df_wina.empty else df_pmu_final.assign(**{'Cote Wina': np.nan})
             
@@ -454,10 +562,10 @@ def process_single_match(event_pmu, event_wina, url_betclic, args, gsheet_creden
         df_final = df_final.drop(columns=['home'], errors='ignore')
             
         export_to_google_sheets(df_final, gsheet_credentials, GSHEET_NAME, df_final.loc[0, 'Match'])
-        print(f"[{event_pmu}] Terminé avec succès.")
+        logging.info(f"[{event_pmu}] Terminé avec succès.")
         
     except Exception as e:
-        print(f"[{event_pmu}] ERREUR GLOBALE : {e}")
+        logging.info(f"[{event_pmu}] ERREUR GLOBALE : {e}")
         
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -470,6 +578,7 @@ if __name__ == "__main__":
     parser.add_argument("-c", "--cote-out", type=float, default=4.0)
     parser.add_argument("-r", "--ratio-min", type=float, default=1.15)
     parser.add_argument("-s", "--name-match-score", type=int, default=85)
+    parser.add_argument("--headless", type=bool, default=True)
     
     args = parser.parse_args()
     
@@ -486,25 +595,34 @@ if __name__ == "__main__":
     # Paramètre anti-bot clé : 2 à 3 workers max pour ne pas alerter Datadome
     MAX_WORKERS = 2 
     
-    print(f"Lancement du traitement par lots ({len(matches)} matchs, {MAX_WORKERS} processus simultanés)...")
+    logging.info(f"Lancement du traitement par lots ({len(matches)} matchs, {MAX_WORKERS} processus simultanés)...")
     
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = []
-        for index, (event_pmu, event_wina, url_betclic) in enumerate(matches):
-            event_pmu = int(event_pmu)
-            event_wina = int(event_wina)
+        for index, row in enumerate(matches.tolist() if isinstance(matches, np.ndarray) else matches):
+            event_pmu = int(row[0])
+            event_wina = int(row[1])
+            url_betclic = str(row[2]).strip()
             
-            # Attribue un délai aléatoire croissant pour séparer les lancements de navigateurs
-            # Le 1er démarre de suite, le 2ème entre 3s et 7s plus tard, etc.
+            # --- FUSION DES DEUX COLONNES D'ÉQUIPES ---
+            titulaires = []
+            
+            # Colonne 4 : Équipe Domicile (Index 3)
+            if len(row) > 3 and pd.notna(row[3]):
+                titulaires.extend([t.strip() for t in str(row[3]).split(',') if t.strip()])
+                
+            # Colonne 5 : Équipe Extérieure (Index 4)
+            if len(row) > 4 and pd.notna(row[4]):
+                titulaires.extend([t.strip() for t in str(row[4]).split(',') if t.strip()])
+            
             jitter = index * random.uniform(3.0, 7.0)
             
             futures.append(executor.submit(
                 process_single_match, 
-                event_pmu, event_wina, url_betclic, 
+                event_pmu, event_wina, url_betclic, titulaires,
                 args, GSHEET_CREDENTIALS, jitter
             ))
             
         for future in as_completed(futures):
-            # Capture d'éventuelles exceptions silencieuses dans les threads
             if future.exception() is not None:
-                print(f"Un thread a planté : {future.exception()}")
+                logging.error(f"Un thread a planté : {future.exception()}")
