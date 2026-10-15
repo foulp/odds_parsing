@@ -75,9 +75,9 @@ class CliTests(unittest.TestCase):
         self.assertFalse(parser.parse_args([]).flashscore)
         self.assertTrue(parser.parse_args(["--flashscore"]).flashscore)
 
-    def test_default_input_is_matchs_csv(self):
+    def test_default_input_is_automatic_discovery(self):
         args = parser.parse_args([])
-        self.assertEqual(args.file, "matchs.csv")
+        self.assertIsNone(args.file)
         for name in ("limit", "event_pmu", "event_wina", "url_betclic"):
             self.assertFalse(hasattr(args, name))
 
@@ -95,6 +95,22 @@ class CliTests(unittest.TestCase):
 
 
 class MatchingTests(unittest.TestCase):
+    def test_unavailable_odds_warn_only_for_retained_pmu_players(self):
+        wina = [
+            {"home": 1, "Nom": "Alice", "Cote": 2.0},
+            {"home": 1, "Nom": "Erwan Colas", "Cote": float("nan")},
+        ]
+        frame = players_frame().iloc[:1].copy()
+        with self.assertNoLogs(level="WARNING"):
+            mapping, _, _ = parser.match_wina_players(frame, wina, 80)
+        self.assertEqual(mapping, {"Alice": "Alice"})
+        frame.loc["extra"] = dict(frame.iloc[0], Joueurs="Erwan Colas")
+        with self.assertLogs(level="WARNING") as logs:
+            mapping, _, _ = parser.match_wina_players(frame, wina, 80)
+        self.assertEqual(mapping, {"Alice": "Alice"})
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn('PMU="Erwan Colas" ; WINAMAX="Erwan Colas"', logs.output[0])
+
     def test_matching_is_team_scoped_and_computes_ratios(self):
         wina = [
             {"home": 1, "Nom": "ALICE", "Cote": 1.5},
@@ -108,12 +124,12 @@ class MatchingTests(unittest.TestCase):
     def test_exact_match_wins_over_fuzzy_collision(self):
         frame = players_frame().iloc[:2].copy()
         frame["Joueurs"] = ["Alicia", "Alice"]
-        with self.assertLogs(level="WARNING") as logs:
+        with self.assertLogs(level="INFO") as logs:
             mapping, _, _ = parser.match_wina_players(
                 frame, [{"home": 1, "Nom": "Alice", "Cote": 2.0}], 50,
             )
         self.assertEqual(mapping, {"Alice": "Alice"})
-        self.assertIn("AMBIGU", " ".join(logs.output))
+        self.assertIn("tous les candidats sont deja attribues", " ".join(logs.output))
 
     def test_empty_candidates_and_invalid_odds(self):
         self.assertEqual(parser.match_wina_players(players_frame(), [], 85), ({}, {}, []))
@@ -126,6 +142,14 @@ class MatchingTests(unittest.TestCase):
 
 
 class PmuTests(unittest.TestCase):
+    def test_quote_warning_uses_match_name_when_available(self):
+        session = MagicMock()
+        session.get.return_value.json.return_value = {}
+        with self.assertLogs(level="WARNING") as logs:
+            parser.get_pmu_combi_odds(123, ["1", "2"], session, match_name="Home - Away")
+        self.assertIn("[Home - Away]", logs.output[0])
+        self.assertNotIn("[123]", logs.output[0])
+
     def test_session_retries_are_bounded_and_get_only(self):
         with parser.create_pmu_session() as session:
             retry = session.get_adapter("https://example.test").max_retries
@@ -291,6 +315,19 @@ class BrowserTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Structure Winamax"):
             parser.extract_wina_players(tableaux)
 
+    def test_unavailable_odds_keep_identity_without_exposing_a_clickable_button(self):
+        tableaux = MagicMock()
+        tableaux.count.return_value = 1
+        tableaux.nth.return_value.locator.return_value.evaluate.return_value = {
+            "names": ["Erwan Colas"], "odds": ["1", "2", "-"], "buttons": 3,
+        }
+        with self.assertLogs(level="DEBUG") as logs:
+            buttons, players = parser.extract_wina_players(tableaux)
+        self.assertEqual(buttons, {})
+        self.assertEqual(players[0]["Nom"], "Erwan Colas")
+        self.assertTrue(pd.isna(players[0]["Cote"]))
+        self.assertTrue(all(line.startswith("DEBUG:") for line in logs.output))
+
     def test_browser_closes_on_failure(self):
         with patch.object(parser, "sync_playwright") as playwright:
             browser = playwright.return_value.__enter__.return_value.chromium.launch.return_value
@@ -318,8 +355,8 @@ class BrowserTests(unittest.TestCase):
         self.assertNotIn("outcome_id", pmu.columns)
         self.assertTrue(wina.empty)
         self.assertEqual(quote.call_count, 2)
-        quote.assert_any_call(123, ["1", "2"], session=session)
-        quote.assert_any_call(123, ["4", "5"], session=session)
+        quote.assert_any_call(123, ["1", "2"], session=session, match_name="Home - Away")
+        quote.assert_any_call(123, ["4", "5"], session=session, match_name="Home - Away")
         session.close.assert_not_called()
 
 
@@ -436,6 +473,37 @@ class SheetsTests(unittest.TestCase):
         self.sheet = self.auth.return_value.open.return_value
         self.worksheet = self.sheet.worksheet.return_value
         self.worksheet.id = 42
+        self.worksheet.row_values.return_value = ["Heure", *self.frame.columns.tolist()]
+
+    def test_betclic_and_winamax_have_identical_gradients_per_combination_size(self):
+        for betclic_only in (False, True):
+            frame = self.frame.copy()
+            frame["Ratio (PMU/Betclic)"] = [1.1, float("nan")]
+            if betclic_only:
+                frame = frame.drop(columns="Ratio (PMU/Wina)")
+            for existing in ([], ["Heure", "old"]):
+                with self.subTest(betclic_only=betclic_only, existing=existing), \
+                        patch.object(parser, "set_with_dataframe"):
+                    self.worksheet.col_values.return_value = existing
+                    self.worksheet.row_values.return_value = ["Heure", *frame.columns.tolist()]
+                    parser.export_to_google_sheets(frame, "key.json", "book", "match")
+                    requests = self.sheet.batch_update.call_args.args[0]["requests"]
+                    rules = [r["addConditionalFormatRule"]["rule"] for r in requests
+                             if "addConditionalFormatRule" in r]
+                    expected_columns = [
+                        frame.columns.get_loc(name) + 1
+                        for name in ("Ratio (PMU/Wina)", "Ratio (PMU/Betclic)")
+                        if name in frame.columns
+                    ]
+                    first_data = 2 if existing else 1
+                    self.assertEqual(
+                        [(r["ranges"][0]["startRowIndex"], r["ranges"][0]["endRowIndex"],
+                          r["ranges"][0]["startColumnIndex"]) for r in rules],
+                        [(row, row + 1, column)
+                         for row in (first_data, first_data + 1) for column in expected_columns],
+                    )
+                    self.assertTrue(all(r["gradientRule"] == rules[0]["gradientRule"] for r in rules))
+                    self.assertEqual(rules[0]["gradientRule"]["midpoint"]["value"], "50")
 
     def test_empty_and_existing_sheet_ranges_and_batched_formatting(self):
         for existing, start, header, end in (
@@ -507,7 +575,7 @@ class SheetsTests(unittest.TestCase):
             parser.process_single_match(123, 456, "", args, "key.json", 0)
         frame, credentials, book, match = export.call_args.args
         self.assertEqual(frame.columns.tolist(), [
-            "Match", "Equipe", "Taille Combi", "Joueurs", "Cote PMU", "Cote Wina",
+            "Match", "Equipe", "Taille Combi", "Joueurs", "Cote PMU", "Cote Wina", "Cote Betclic",
             "Ratio (PMU/Wina)", "Ratio (PMU/Betclic)",
         ])
         self.assertEqual(frame["Joueurs"].tolist(), ["Bob", "Alice", "Chris", "Dan", "Eve"])
@@ -515,11 +583,11 @@ class SheetsTests(unittest.TestCase):
         self.assertTrue(frame["Cote Wina"].iloc[2:].isna().all())
         self.assertEqual((credentials, book, match), ("key.json", "book", "Home - Away"))
 
-    def test_flashscore_filter_is_opt_in(self):
+    def test_flashscore_flag_controls_probable_policy_not_official_filtering(self):
         for enabled in (True, False):
             with self.subTest(enabled=enabled):
                 args = parser.parse_args(["--flashscore"] if enabled else [])
-                expected = ["Alice", "Eve"] if enabled else ["Alice", "Bob", "Chris", "Dan", "Eve"]
+                expected = ["Alice", "Eve"]
 
                 def run_wina(url, event, singles, *args, **kwargs):
                     self.assertEqual(singles["Joueurs"].tolist(), expected)
@@ -534,8 +602,9 @@ class SheetsTests(unittest.TestCase):
                         patch.object(parser, "export_to_google_sheets"):
                     parser.process_single_match(123, 456, "", args, "key.json", 0, ["match"])
                 run.assert_called_once()
-                self.assertEqual(get_lineups.call_count, int(enabled))
-                self.assertEqual(filter_lineups.call_count, int(enabled))
+                self.assertEqual(get_lineups.call_count, 1)
+                self.assertEqual(get_lineups.call_args.kwargs["allow_probable"], enabled)
+                self.assertEqual(filter_lineups.call_count, 1)
 
 
 if __name__ == "__main__":

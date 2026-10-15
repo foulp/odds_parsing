@@ -1,0 +1,5 @@
+.match-cache/
+__pycache__/
+.venv/
+scraping.log
+credentials.json

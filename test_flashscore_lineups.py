@@ -121,6 +121,13 @@ def group_html(heading, prefix="starter", count=11, goalkeeper=True):
 
 
 class LocalDomTests(unittest.TestCase):
+    def test_empty_competition_calendar_is_normal_but_not_a_blank_page(self):
+        with wina_page(True) as page:
+            page.route("https://www.flashscore.fr/**", lambda route: route.fulfill(
+                content_type="text/html", body='<div class="noMatchFound">Aucun match</div>',
+            ))
+            self.assertEqual(flashscore.discover_matches(page, allow_empty=True), [])
+
     def test_probable_and_announced_lineups_exclude_keepers_and_substitutes(self):
         with wina_page(True) as page:
             for heading in ("Compositions probables", "Compositions de départ"):
@@ -129,7 +136,8 @@ class LocalDomTests(unittest.TestCase):
                     page.route("https://fixture.test/**", lambda route: route.fulfill(
                         content_type="text/html; charset=utf-8", body=html,
                     ))
-                    lineups = flashscore.read_lineups(page, "https://fixture.test/match/a?mid=1")
+                    lineups = flashscore.read_lineups(page, "https://fixture.test/match/a?mid=1",
+                                                      allow_probable=True)
                     for home, side in ((1, "left"), (0, "right")):
                         self.assertEqual(len(lineups[home]), 10)
                         self.assertEqual(lineups[home][0]["name"], f"starter {side} 1")
@@ -143,7 +151,33 @@ class LocalDomTests(unittest.TestCase):
                 body=group_html("Compositions probables", goalkeeper=False),
             ))
             with self.assertRaisesRegex(ValueError, "Gardien"):
-                flashscore.read_lineups(page, "https://fixture.test/match/a")
+                flashscore.read_lineups(page, "https://fixture.test/match/a", allow_probable=True)
+
+    def test_probable_lineups_do_not_filter_by_default(self):
+        with wina_page(True) as page:
+            page.route("https://fixture.test/**", lambda route: route.fulfill(
+                content_type="text/html; charset=utf-8", body=group_html("Compositions probables"),
+            ))
+            self.assertIsNone(flashscore.read_lineups(page, "https://fixture.test/match/a"))
+
+    def test_official_lineup_is_preferred_even_when_probable_is_allowed(self):
+        with wina_page(True) as page:
+            page.route("https://fixture.test/**", lambda route: route.fulfill(
+                content_type="text/html; charset=utf-8",
+                body=group_html("Compositions probables", "probable")
+                + group_html("Compositions de départ", "official"),
+            ))
+            result = flashscore.read_lineups(page, "https://fixture.test/match/a", allow_probable=True)
+            self.assertTrue(result[1][0]["name"].startswith("official"))
+
+    def test_missing_groups_only_count_as_absent_on_loaded_match_without_compo_tab(self):
+        page = MagicMock()
+        page.locator.return_value.first.wait_for.side_effect = flashscore.PlaywrightTimeoutError("absent")
+        page.locator.return_value.count.return_value = 0
+        self.assertIsNone(flashscore.read_lineups(page, "https://fixture.test/match/a"))
+        page.locator.return_value.count.return_value = 1
+        with self.assertRaises(flashscore.PlaywrightTimeoutError):
+            flashscore.read_lineups(page, "https://fixture.test/match/a")
 
     def test_discovery_excludes_other_dates_and_preserves_sides(self):
         html = "".join(
