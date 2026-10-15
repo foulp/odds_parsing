@@ -72,6 +72,7 @@ jobs:
         run: >-
           python -m unittest -q test_match_discovery test_flashscore_lineups
           test_name_matching test_master_odds_parser test_betclic_odds
+          test_page_diagnostics
       - name: Installer les identifiants Google
         if: ${{ inputs.export_sheets }}
         env:

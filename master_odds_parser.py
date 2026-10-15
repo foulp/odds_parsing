@@ -50,6 +50,7 @@ from flashscore_lineups import get_today_matches, get_match_lineups, filter_play
 from betclic_odds import extract_markets as extract_betclic_markets, build_results as build_betclic_results
 from name_matching import DEFAULT_MATCH_SCORE, match_names
 from match_discovery import COMPETITIONS, PARIS, get_daily_matches, select_matches
+from page_diagnostics import capture_market_diagnostic
 
 
 def configure_logging():
@@ -504,9 +505,15 @@ def run_master_wina_and_pmu(url_match, event_id_pmu, df_pmu_simples, tailles_com
         except: pass
 
         try:
-            page.get_by_text("Joueur décisif", exact=True).first.wait_for(timeout=10000)
+            page.get_by_text("Joueur décisif", exact=True).first.wait_for(timeout=30000)
         except PlaywrightTimeoutError:
-            logging.warning("[%s] Marche Joueur decisif indisponible sur Winamax", nom_match_log)
+            capture_market_diagnostic(
+                page, "winamax", event_id_pmu, "Joueur décisif",
+            )
+            logging.warning(
+                "[%s] Marche Joueur decisif non detecte sur Winamax apres 30 s ; "
+                "aucune cote Winamax ne sera ajoutee.", nom_match_log,
+            )
             return df_pmu_simples.drop(columns=['outcome_id']), pd.DataFrame()
 
         tableaux = prepare_wina_market(page)

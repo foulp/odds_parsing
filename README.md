@@ -62,6 +62,9 @@ du texte visible et les premiers liens de matchs ; une capture PNG de la page
 est jointe pour voir les messages eventuels masques par le menu dans le journal.
 Cela permet de distinguer une redirection, un refus d'acces et un chargement
 incomplet sans conclure a un blocage sur la seule base d'un timeout.
+La detection des marches sur les pages de match attend jusqu'a 30 secondes ;
+si elle echoue encore, le journal et les artifacts contiennent aussi un
+diagnostic JSON et une capture de la page Winamax ou Betclic.
 Les compositions officielles restent filtrees uniquement si elles sont publiees.
 
 Le meme mode de test est disponible localement :
