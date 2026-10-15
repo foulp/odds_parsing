@@ -29,7 +29,6 @@ une fois. Un second echec arrete le match plutot que poursuivre des lectures dou
 """
 
 import argparse
-from pathlib import Path
 from datetime import date, datetime, timedelta
 import requests
 import time
@@ -50,7 +49,6 @@ from flashscore_lineups import get_today_matches, get_match_lineups, filter_play
 from betclic_odds import extract_markets as extract_betclic_markets, build_results as build_betclic_results
 from name_matching import DEFAULT_MATCH_SCORE, match_names
 from match_discovery import COMPETITIONS, PARIS, get_daily_matches, select_matches
-from page_diagnostics import capture_market_diagnostic
 
 
 def configure_logging():
@@ -505,15 +503,9 @@ def run_master_wina_and_pmu(url_match, event_id_pmu, df_pmu_simples, tailles_com
         except: pass
 
         try:
-            page.get_by_text("Joueur décisif", exact=True).first.wait_for(timeout=30000)
+            page.get_by_text("Joueur décisif", exact=True).first.wait_for(timeout=10000)
         except PlaywrightTimeoutError:
-            capture_market_diagnostic(
-                page, "winamax", event_id_pmu, "Joueur décisif",
-            )
-            logging.warning(
-                "[%s] Marche Joueur decisif non detecte sur Winamax apres 30 s ; "
-                "aucune cote Winamax ne sera ajoutee.", nom_match_log,
-            )
+            logging.warning("[%s] Marche Joueur decisif indisponible sur Winamax", nom_match_log)
             return df_pmu_simples.drop(columns=['outcome_id']), pd.DataFrame()
 
         tableaux = prepare_wina_market(page)
@@ -678,14 +670,8 @@ def process_single_match(event_pmu, event_wina, url_betclic, args, gsheet_creden
         df_final = df_final.sort_values(by=['Taille Combi', 'home', 'Ratio (PMU/Wina)', 'Ratio (PMU/Betclic)'], ascending=[True, False, False, False])
         df_final = df_final.drop(columns=['home'], errors='ignore')
             
-        if args.export:
-            with timed_stage(match_label, "export Google Sheets"):
-                export_to_google_sheets(df_final, gsheet_credentials, GSHEET_NAME, df_final.iloc[0]['Match'])
-        else:
-            output = Path("results") / f"{event_pmu}.csv"
-            output.parent.mkdir(parents=True, exist_ok=True)
-            df_final.to_csv(output, sep=";", index=False)
-            logging.info("[%s] Export Sheets desactive ; resultats : %s", match_label, output)
+        with timed_stage(match_label, "export Google Sheets"):
+            export_to_google_sheets(df_final, gsheet_credentials, GSHEET_NAME, df_final.iloc[0]['Match'])
         logging.info("[%s] Termine avec succes.", match_label)
         
     except Exception:
@@ -724,8 +710,6 @@ def parse_args(argv=None):
                         help="Navigateur masque par defaut ; --no-headless pour l'afficher")
     parser.add_argument("--flashscore", action="store_true",
                         help="Accepter aussi les compositions probables (officielles seules par defaut)")
-    parser.add_argument("--export", action=argparse.BooleanOptionalAction, default=True,
-                        help="Export Google Sheets par defaut ; --no-export ecrit seulement dans results/")
     
     args = parser.parse_args(argv)
     if any(taille < 2 for taille in args.tailles):

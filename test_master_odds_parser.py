@@ -1,6 +1,5 @@
 from itertools import combinations
-from pathlib import Path
-from tempfile import TemporaryDirectory
+import argparse
 from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
@@ -72,10 +71,6 @@ class CombinationTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
-    def test_sheets_export_is_default_and_can_be_disabled(self):
-        self.assertTrue(parser.parse_args([]).export)
-        self.assertFalse(parser.parse_args(["--no-export"]).export)
-
     def test_flashscore_is_opt_in(self):
         self.assertFalse(parser.parse_args([]).flashscore)
         self.assertTrue(parser.parse_args(["--flashscore"]).flashscore)
@@ -465,41 +460,6 @@ class LocalDomTests(unittest.TestCase):
 
 
 class SheetsTests(unittest.TestCase):
-    def test_no_export_writes_csv_without_google_credentials(self):
-        frame = players_frame().drop(columns="outcome_id")
-        with TemporaryDirectory() as directory, \
-                patch.object(parser, "Path", return_value=Path(directory) / "results"), \
-                patch.object(parser, "get_pmu_players_dict", return_value=frame), \
-                patch.object(parser, "run_master_wina_and_pmu", return_value=(frame, pd.DataFrame())), \
-                patch.object(parser, "run_betclic_extraction") as betclic, \
-                patch.object(parser, "export_to_google_sheets") as export, \
-                patch.object(parser.gspread, "service_account") as auth:
-            parser.process_single_match(
-                123, 456, "", parser.parse_args(["--no-export"]), "missing.json", 0,
-            )
-            output = Path(directory) / "results" / "123.csv"
-            result = pd.read_csv(output, sep=";")
-            self.assertEqual(len(result), len(frame))
-            self.assertEqual(set(result["Joueurs"]), set(frame["Joueurs"]))
-            self.assertIn("Ratio (PMU/Wina)", result)
-            self.assertIn("Ratio (PMU/Betclic)", result)
-            self.assertNotIn("home", result)
-            export.assert_not_called()
-            auth.assert_not_called()
-            betclic.assert_not_called()
-
-    def test_csv_write_failure_is_reported_and_propagates(self):
-        frame = players_frame().drop(columns="outcome_id")
-        with TemporaryDirectory() as directory, \
-                patch.object(parser, "Path", return_value=Path(directory)), \
-                patch.object(parser, "get_pmu_players_dict", return_value=frame), \
-                patch.object(parser, "run_master_wina_and_pmu", return_value=(frame, pd.DataFrame())), \
-                patch.object(pd.DataFrame, "to_csv", side_effect=OSError("disk full")), \
-                self.assertLogs(level="ERROR"), self.assertRaisesRegex(OSError, "disk full"):
-            parser.process_single_match(
-                123, 456, "", parser.parse_args(["--no-export"]), "missing.json", 0,
-            )
-
     def setUp(self):
         self.frame = pd.DataFrame({
             "Match": ["Home - Away", "Home - Away"],
@@ -583,7 +543,10 @@ class SheetsTests(unittest.TestCase):
             parser.export_to_google_sheets(self.frame, "key.json", "book", "match")
 
     def test_match_failure_is_not_reported_as_success(self):
-        args = parser.parse_args(["--tailles", "2", "--name-match-score", "85"])
+        args = argparse.Namespace(
+            tailles=[2], cote_out=4, ratio_min=1.15,
+            name_match_score=85, headless=True, flashscore=False,
+        )
         singles = players_frame()
         with patch.object(parser, "GSHEET_NAME", "book", create=True), \
                 patch.object(parser, "get_pmu_players_dict", return_value=singles), \
@@ -595,7 +558,10 @@ class SheetsTests(unittest.TestCase):
         self.assertNotIn("Terminé avec succès", " ".join(logs.output))
 
     def test_final_export_preserves_columns_ratios_and_sort_order(self):
-        args = parser.parse_args(["--tailles", "2", "--name-match-score", "85"])
+        args = argparse.Namespace(
+            tailles=[2], cote_out=4, ratio_min=1.15,
+            name_match_score=85, headless=True, flashscore=False,
+        )
         singles = players_frame()
         wina = pd.DataFrame([
             {"Taille Combi": 1, "Joueurs": "Alice", "Cote Wina": 2.0},

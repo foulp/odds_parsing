@@ -12,7 +12,6 @@ import math
 import pandas as pd
 from playwright.sync_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError, expect
 from name_matching import DEFAULT_MATCH_SCORE, normalize_name, match_names, matches_abbreviation
-from page_diagnostics import capture_market_diagnostic
 
 
 SINGLES_MARKET = "Joueur décisif (buteur ou passeur décisif) + son remplaçant (t. rég)"
@@ -138,15 +137,9 @@ def extract_markets(page):
     # Le SuperSub est sur la page principale, pas dans la categorie Joueurs.
     singles_section = market_section(page, SINGLES_MARKET)
     try:
-        singles_section.wait_for(timeout=30000)
+        singles_section.wait_for(timeout=10000)
     except PlaywrightTimeoutError:
-        capture_market_diagnostic(
-            page, "betclic", page.url, SINGLES_MARKET,
-        )
-        logging.warning(
-            "[BETCLIC] Marche simples SuperSub non detecte apres 30 s : %s ; "
-            "aucune cote Betclic ne sera ajoutee.", page.url,
-        )
+        logging.warning("[BETCLIC] Marche simples SuperSub indisponible : %s", page.url)
         return [], []
     players = read_singles(singles_section)
     page.get_by_text("Joueurs", exact=True).first.click(timeout=10000)

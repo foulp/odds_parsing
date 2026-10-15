@@ -3,5 +3,3 @@ __pycache__/
 .venv/
 scraping.log
 credentials.json
-results/
-diagnostics/
