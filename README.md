@@ -18,11 +18,16 @@ Il doit etre publie sur la branche par defaut du depot pour apparaitre dans
 
 1. Pousser les fichiers sur GitHub, puis ouvrir **Actions > Comparer les cotes >
    Run workflow**.
-2. Choisir une competition, renseigner un seul match exact, et choisir la date
-   (vide = aujourd'hui a Paris, `demain` ou `AAAA-MM-JJ`).
+2. Choisir le mode :
+   - **automatic** decouvre la rencontre ; choisir la competition, indiquer le
+     nom exact et la date (vide = aujourd'hui a Paris, `demain` ou `AAAA-MM-JJ`) ;
+   - **manual** saute la decouverte du calendrier Winamax : saisir les
+     identifiants PMU et Winamax du meme match, et eventuellement son URL Betclic.
+     L'identifiant Winamax est utilise pour ouvrir directement sa page de match.
 3. Pour le premier essai, garder les duos et laisser **Ecrire dans Google Sheets**
-   decoche. Les trois bookmakers sont consultes, sans authentification Google
-   ni ecriture dans Sheets. Aucune mise n'est placee.
+   decoche. En mode manuel, PMU et Winamax sont consultes, ainsi que Betclic si
+   son URL est fournie, sans authentification Google ni ecriture dans Sheets.
+   Aucune mise n'est placee.
 4. Ouvrir l'execution pour consulter ses logs. Les fichiers CSV et le journal
    sont telechargeables dans ses **Artifacts**, conserves pendant sept jours.
    Une execution verte sans CSV peut simplement indiquer qu'aucun match n'est
@@ -46,6 +51,8 @@ Chaque execution repart sans cache de matchs et est limitee a 60 minutes.
 Les quotas et la facturation GitHub Actions dependent de l'offre du depot.
 Les sites peuvent bloquer les IP des runners GitHub : le premier essai sert
 a verifier cet acces, qui ne peut pas etre garanti par les tests hors ligne.
+Le mode manuel evite uniquement la decouverte des identifiants : il ne contourne
+pas un refus d'acces de Winamax sur la page du match ou ses cotes.
 Un echec ne doit pas etre interprete comme une absence de cotes.
 Si Winamax ne charge pas les donnees de competition, le journal et les artifacts
 incluent un diagnostic JSON : statut HTTP de navigation, URL finale, titre,

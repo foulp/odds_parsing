@@ -3,6 +3,11 @@ name: Comparer les cotes
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: Source des références du match
+        type: choice
+        options: [automatic, manual]
+        default: automatic
       competition:
         description: Competition
         type: choice
@@ -11,11 +16,23 @@ on:
       match:
         description: "Un match exact (ex. Le Mans - Toulouse)"
         type: string
-        required: true
+        required: false
       date:
         description: "Date Europe/Paris : demain ou AAAA-MM-JJ (vide = aujourd'hui)"
         type: string
         default: ""
+      event_pmu:
+        description: "Mode manuel : identifiant de l'événement PMU"
+        type: string
+        required: false
+      event_wina:
+        description: "Mode manuel : identifiant du match Winamax"
+        type: string
+        required: false
+      url_betclic:
+        description: "Mode manuel : URL du match Betclic (facultatif)"
+        type: string
+        required: false
       tailles:
         description: Tailles des combinaisons (les simples sont toujours inclus)
         type: choice
@@ -83,18 +100,59 @@ jobs:
           COMPETITION: ${{ inputs.competition }}
           MATCH: ${{ inputs.match }}
           MATCH_DATE: ${{ inputs.date }}
+          MODE: ${{ inputs.mode }}
+          EVENT_PMU: ${{ inputs.event_pmu }}
+          EVENT_WINA: ${{ inputs.event_wina }}
+          URL_BETCLIC: ${{ inputs.url_betclic }}
           TAILLES: ${{ inputs.tailles }}
           EXPORT_SHEETS: ${{ inputs.export_sheets }}
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -z "${MATCH//[[:space:]]/}" ]]; then
-            echo "::error::Un nom de match est obligatoire."
+          args=()
+          if [[ "$MODE" == "manual" ]]; then
+            python - <<'PY'
+          import csv
+          import os
+          from pathlib import Path
+          from urllib.parse import urlparse
+
+          values = {
+              "event_pmu": os.environ["EVENT_PMU"].strip(),
+              "event_wina": os.environ["EVENT_WINA"].strip(),
+          }
+          for name, value in values.items():
+              if not value.isdecimal() or int(value) <= 0:
+                  raise SystemExit(f"{name} doit etre un identifiant entier positif.")
+
+          betclic_url = os.environ["URL_BETCLIC"].strip()
+          if betclic_url:
+              parsed = urlparse(betclic_url)
+              if parsed.scheme != "https" or parsed.hostname not in {"betclic.fr", "www.betclic.fr"}:
+                  raise SystemExit("url_betclic doit etre une URL https://www.betclic.fr/...")
+
+          with Path("workflow-match.csv").open("w", newline="", encoding="utf-8") as stream:
+              writer = csv.DictWriter(
+                  stream,
+                  fieldnames=["event_pmu", "event_wina", "url_betclic"],
+                  delimiter=";",
+              )
+              writer.writeheader()
+              writer.writerow({**values, "url_betclic": betclic_url})
+          PY
+            args+=(--file workflow-match.csv)
+          elif [[ "$MODE" == "automatic" ]]; then
+            if [[ -z "${MATCH//[[:space:]]/}" ]]; then
+              echo "::error::Le nom du match est obligatoire en mode automatique."
+              exit 1
+            fi
+            args+=(-c "$COMPETITION" -m "$MATCH")
+            if [[ -n "$MATCH_DATE" ]]; then
+              args+=(--date "$MATCH_DATE")
+            fi
+          else
+            echo "::error::Mode d'exécution invalide."
             exit 1
-          fi
-          args=(-c "$COMPETITION" -m "$MATCH")
-          if [[ -n "$MATCH_DATE" ]]; then
-            args+=(--date "$MATCH_DATE")
           fi
           read -r -a sizes <<< "$TAILLES"
           args+=(--tailles "${sizes[@]}")
@@ -104,7 +162,7 @@ jobs:
           python master_odds_parser.py "${args[@]}"
       - name: Supprimer les identifiants temporaires
         if: ${{ always() }}
-        run: rm -f -- credentials.json
+        run: rm -f -- credentials.json workflow-match.csv
       - name: Conserver les resultats et les logs
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
