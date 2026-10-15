@@ -114,5 +114,6 @@ jobs:
             results/*.csv
             scraping.log
             diagnostics/*.json
+            diagnostics/*.png
           if-no-files-found: ignore
           retention-days: 7

@@ -50,6 +50,9 @@ Un echec ne doit pas etre interprete comme une absence de cotes.
 Si Winamax ne charge pas les donnees de competition, le journal et les artifacts
 incluent un diagnostic JSON : statut HTTP de navigation, URL finale, titre,
 presence des donnees attendues et debut du texte visible de la page publique.
+Le diagnostic contient aussi le type et les cles de l'etat initial, la fin
+du texte visible et les premiers liens de matchs ; une capture PNG de la page
+est jointe pour voir les messages eventuels masques par le menu dans le journal.
 Cela permet de distinguer une redirection, un refus d'acces et un chargement
 incomplet sans conclure a un blocage sur la seule base d'un timeout.
 Les compositions officielles restent filtrees uniquement si elles sont publiees.

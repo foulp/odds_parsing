@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 from zoneinfo import ZoneInfo
 
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright, Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
 from thefuzz import fuzz
 
 from flashscore_lineups import discover_matches, normalize_team
@@ -102,9 +102,14 @@ def read_winamax_matches(page, competition, today):
             title: document.title,
             readyState: document.readyState,
             hasState: !!window.PRELOADED_STATE,
+            stateType: typeof window.PRELOADED_STATE,
+            stateKeys: Object.keys(window.PRELOADED_STATE || {}).slice(0, 50),
             hasTournament: !!window.PRELOADED_STATE?.tournaments?.[id],
             hasMatches: !!window.PRELOADED_STATE?.matches,
-            text: (document.body?.innerText || '').slice(0, 2000)
+            text: (document.body?.innerText || '').slice(0, 2000),
+            textEnd: (document.body?.innerText || '').slice(-6000),
+            matchLinks: Array.from(document.querySelectorAll('a[href*="/match/"]'))
+                .slice(0, 10).map(a => ({url: a.href, text: a.innerText}))
         })""", tournament)
         diagnostic["status"] = response.status if response is not None else None
         logging.error("[DECOUVERTE] Winamax %s : donnees non chargees ; diagnostic=%s",
@@ -115,6 +120,10 @@ def read_winamax_matches(page, competition, today):
             output.write_text(json.dumps(diagnostic, ensure_ascii=True, indent=2), encoding="utf-8")
         except OSError:
             logging.exception("[DECOUVERTE] Impossible d'enregistrer le diagnostic Winamax")
+        try:
+            page.screenshot(path=str(output.with_suffix(".png")), full_page=True, timeout=10000)
+        except (OSError, PlaywrightError):
+            logging.exception("[DECOUVERTE] Impossible d'enregistrer la capture Winamax")
         raise RuntimeError(
             f"Winamax {competition} : donnees de competition non chargees apres 20 s "
             f"(HTTP {diagnostic['status']}). Blocage, redirection ou chargement incomplet possible ; "

@@ -150,6 +150,20 @@ class AdapterTests(unittest.TestCase):
             discovery.read_winamax_matches(page, "l1", DAY)
         self.assertIn("Access denied", " ".join(logs.output))
         self.assertEqual(page.evaluate.call_count, 1)
+        page.screenshot.assert_called_once()
+        self.assertTrue(page.screenshot.call_args.kwargs["full_page"])
+
+    def test_winamax_screenshot_failure_preserves_original_timeout_error(self):
+        page = MagicMock()
+        page.goto.return_value.status = 200
+        page.wait_for_function.side_effect = discovery.PlaywrightTimeoutError("timeout")
+        page.evaluate.return_value = {"title": "Paris sportifs"}
+        page.screenshot.side_effect = discovery.PlaywrightError("Page closed")
+        with TemporaryDirectory() as directory, \
+                patch.object(discovery, "Path", return_value=Path(directory)), \
+                self.assertLogs(level="ERROR"), \
+                self.assertRaisesRegex(RuntimeError, "HTTP 200"):
+            discovery.read_winamax_matches(page, "l1", DAY)
 
     def test_winamax_timeout_persists_diagnostic_without_assuming_http_block(self):
         page = MagicMock()
