@@ -4,6 +4,60 @@ Le script compare PMU, Winamax et Betclic et ajoute les resultats a Google
 Sheets. Les dependances Python, Chromium Playwright et les identifiants Google
 Sheets doivent deja etre disponibles dans l'environnement utilise.
 
+```bash
+python3 -m pip install -r requirements.txt
+python3 -m playwright install --with-deps chromium
+```
+
+## Lancement depuis un navigateur avec GitHub Actions
+
+Le workflow [Comparer les cotes](./.github/workflows/odds.yml) se lance
+manuellement, sans application a installer sur le telephone ou l'ordinateur.
+Il doit etre publie sur la branche par defaut du depot pour apparaitre dans
+**Actions**. Aucune planification automatique n'est activee.
+
+1. Pousser les fichiers sur GitHub, puis ouvrir **Actions > Comparer les cotes >
+   Run workflow**.
+2. Choisir une competition, renseigner un seul match exact, et choisir la date
+   (vide = aujourd'hui a Paris, `demain` ou `AAAA-MM-JJ`).
+3. Pour le premier essai, garder les duos et laisser **Ecrire dans Google Sheets**
+   decoche. Les trois bookmakers sont consultes, sans authentification Google
+   ni ecriture dans Sheets. Aucune mise n'est placee.
+4. Ouvrir l'execution pour consulter ses logs. Les fichiers CSV et le journal
+   sont telechargeables dans ses **Artifacts**, conserves pendant sept jours.
+   Une execution verte sans CSV peut simplement indiquer qu'aucun match n'est
+   disponible ; verifier le journal.
+
+Pour activer Sheets, creer dans **Settings > Secrets and variables > Actions >
+New repository secret** un secret `GOOGLE_CREDENTIALS_JSON` contenant le JSON
+complet d'une **nouvelle** cle de compte de service. Ne jamais reutiliser une
+cle exposee dans Git. Partager le classeur avec l'adresse de ce compte.
+Le classeur attendu est `Joueur decisif PMU/WINA/Betclic` avec les accents
+definis par `GSHEET_NAME` dans [master_odds_parser.py](./master_odds_parser.py).
+Cocher ensuite l'export au lancement et consulter le classeur dans Google Sheets.
+L'export ajoute des lignes : les relances ne remplacent pas les precedentes.
+
+La cle est ecrite uniquement sur la machine temporaire, supprimee apres le
+traitement et exclue des artifacts. Ne pas afficher son contenu dans les logs.
+Les executions de ce workflow sont serialisees pour limiter les exports
+simultanes ; cela ne couvre pas les lancements locaux.
+
+Chaque execution repart sans cache de matchs et est limitee a 60 minutes.
+Les quotas et la facturation GitHub Actions dependent de l'offre du depot.
+Les sites peuvent bloquer les IP des runners GitHub : le premier essai sert
+a verifier cet acces, qui ne peut pas etre garanti par les tests hors ligne.
+Un echec ne doit pas etre interprete comme une absence de cotes.
+Les compositions officielles restent filtrees uniquement si elles sont publiees.
+
+Le meme mode de test est disponible localement :
+
+```bash
+python3 master_odds_parser.py -c l1 --date demain -m "Le Mans - Toulouse" --tailles 2 --no-export
+```
+
+`--no-export` ecrit les resultats dans `results/<identifiant_pmu>.csv`, sans
+cle Google. Une relance du meme match remplace ce CSV local uniquement.
+
 ## Matchs du jour
 
 ```bash

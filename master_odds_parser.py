@@ -29,6 +29,7 @@ une fois. Un second echec arrete le match plutot que poursuivre des lectures dou
 """
 
 import argparse
+from pathlib import Path
 from datetime import date, datetime, timedelta
 import requests
 import time
@@ -670,8 +671,14 @@ def process_single_match(event_pmu, event_wina, url_betclic, args, gsheet_creden
         df_final = df_final.sort_values(by=['Taille Combi', 'home', 'Ratio (PMU/Wina)', 'Ratio (PMU/Betclic)'], ascending=[True, False, False, False])
         df_final = df_final.drop(columns=['home'], errors='ignore')
             
-        with timed_stage(match_label, "export Google Sheets"):
-            export_to_google_sheets(df_final, gsheet_credentials, GSHEET_NAME, df_final.iloc[0]['Match'])
+        if args.export:
+            with timed_stage(match_label, "export Google Sheets"):
+                export_to_google_sheets(df_final, gsheet_credentials, GSHEET_NAME, df_final.iloc[0]['Match'])
+        else:
+            output = Path("results") / f"{event_pmu}.csv"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            df_final.to_csv(output, sep=";", index=False)
+            logging.info("[%s] Export Sheets desactive ; resultats : %s", match_label, output)
         logging.info("[%s] Termine avec succes.", match_label)
         
     except Exception:
@@ -710,6 +717,8 @@ def parse_args(argv=None):
                         help="Navigateur masque par defaut ; --no-headless pour l'afficher")
     parser.add_argument("--flashscore", action="store_true",
                         help="Accepter aussi les compositions probables (officielles seules par defaut)")
+    parser.add_argument("--export", action=argparse.BooleanOptionalAction, default=True,
+                        help="Export Google Sheets par defaut ; --no-export ecrit seulement dans results/")
     
     args = parser.parse_args(argv)
     if any(taille < 2 for taille in args.tailles):

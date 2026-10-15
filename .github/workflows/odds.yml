@@ -1,0 +1,117 @@
+name: Comparer les cotes
+
+on:
+  workflow_dispatch:
+    inputs:
+      competition:
+        description: Competition
+        type: choice
+        options: [l1, ldc, pl]
+        default: l1
+      match:
+        description: "Un match exact (ex. Le Mans - Toulouse)"
+        type: string
+        required: true
+      date:
+        description: "Date Europe/Paris : demain ou AAAA-MM-JJ (vide = aujourd'hui)"
+        type: string
+        default: ""
+      tailles:
+        description: Tailles des combinaisons (les simples sont toujours inclus)
+        type: choice
+        options: ["2", "2 3"]
+        default: "2"
+      export_sheets:
+        description: Ecrire dans Google Sheets (laisser decoche pour le premier test)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: odds-google-sheets
+  cancel-in-progress: false
+
+jobs:
+  odds:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      TZ: Europe/Paris
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Installer les dependances
+        run: |
+          python -m pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+      - name: Verifier les regressions hors ligne
+        run: >-
+          python -m unittest -q test_match_discovery test_flashscore_lineups
+          test_name_matching test_master_odds_parser test_betclic_odds
+      - name: Installer les identifiants Google
+        if: ${{ inputs.export_sheets }}
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          value = os.environ["GOOGLE_CREDENTIALS_JSON"]
+          if not value.strip():
+              raise SystemExit("Secret GOOGLE_CREDENTIALS_JSON manquant.")
+          try:
+              credentials = json.loads(value)
+          except json.JSONDecodeError:
+              raise SystemExit("Secret GOOGLE_CREDENTIALS_JSON : JSON invalide.") from None
+          if not isinstance(credentials, dict) or credentials.get("type") != "service_account":
+              raise SystemExit("Le secret doit contenir une cle JSON de compte de service.")
+          path = Path("credentials.json")
+          path.touch(mode=0o600, exist_ok=False)
+          path.write_text(value, encoding="utf-8")
+          PY
+      - name: Analyser le match
+        env:
+          COMPETITION: ${{ inputs.competition }}
+          MATCH: ${{ inputs.match }}
+          MATCH_DATE: ${{ inputs.date }}
+          TAILLES: ${{ inputs.tailles }}
+          EXPORT_SHEETS: ${{ inputs.export_sheets }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${MATCH//[[:space:]]/}" ]]; then
+            echo "::error::Un nom de match est obligatoire."
+            exit 1
+          fi
+          args=(-c "$COMPETITION" -m "$MATCH")
+          if [[ -n "$MATCH_DATE" ]]; then
+            args+=(--date "$MATCH_DATE")
+          fi
+          read -r -a sizes <<< "$TAILLES"
+          args+=(--tailles "${sizes[@]}")
+          if [[ "$EXPORT_SHEETS" != "true" ]]; then
+            args+=(--no-export)
+          fi
+          python master_odds_parser.py "${args[@]}"
+      - name: Supprimer les identifiants temporaires
+        if: ${{ always() }}
+        run: rm -f -- credentials.json
+      - name: Conserver les resultats et les logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: odds-${{ github.run_id }}
+          path: |
+            results/*.csv
+            scraping.log
+          if-no-files-found: ignore
+          retention-days: 7
