@@ -87,6 +87,34 @@ python3 master_odds_parser.py -c ldc --flashscore
 Les compositions sont relues a chaque analyse, meme si les references sont en
 cache. Une relance apres leur publication applique donc les titulaires officiels.
 
+### Taches planifiees : uniquement les compositions officielles
+
+```bash
+python3 master_odds_parser.py -c l1 --official-lineups-only
+python3 master_odds_parser.py -c pl --official-lineups-only
+```
+
+Cette option ignore les rencontres dont le coup d'envoi est deja atteint et
+celles dont les compositions officielles ne sont pas encore publiees. Seules
+deux compositions completes valides declenchent l'analyse et l'export, avec
+10 joueurs de champ par equipe. Le coup d'envoi est reverifie au demarrage
+du traitement et apres la lecture des compositions. Un traitement deja lance
+n'est pas interrompu si le match commence pendant le calcul des cotes.
+Une erreur technique ou une composition incomplete reste une erreur, pas une
+absence normale. `--flashscore`, qui accepte les probables, est incompatible.
+
+Dans les arguments du Planificateur Windows, ajouter `--official-lineups-only`
+a la commande validee :
+
+```text
+--user timotheeboulet --exec bash -lc "cd /home/timotheeboulet/vscode-repos/foulp/odds_parsing && .venv/bin/python master_odds_parser.py -c l1 --official-lineups-only >> scheduled-run.log 2>&1"
+```
+
+Pour la Premier League, remplacer `-c l1` par `-c pl`.
+Sans cette option, le comportement habituel est conserve. Elle ne memorise pas
+les matchs deja exportes : deux lancements avant le coup d'envoi avec les
+compositions publiees ajoutent tous deux des lignes dans Sheets.
+
 ## Mode manuel
 
 ```bash
@@ -102,10 +130,25 @@ Colonnes optionnelles :
 - `flashscore_url` : fiche du match, pour verifier automatiquement sa composition ;
 - `competition` (`ldc`, `l1`, `pl`) : necessaire pour utiliser `-c` avec le CSV ;
 - `home`, `away` : necessaires pour utiliser `-m` avec le CSV.
+- Avec `--official-lineups-only`, `flashscore_url` et `start` sont obligatoires
+  pour chaque rencontre ; `start` est un horaire ISO avec fuseau, par exemple
+  `2026-10-16T20:45:00+02:00`.
 
 Sans `flashscore_url`, le mode manuel signale qu'il ne filtre pas les titulaires.
 Avec `--flashscore`, il recherche la rencontre sur les pages des competitions
 selectionnees ; pour une competition differente, fournir `flashscore_url`.
+
+## Suivi des executions
+
+Chaque lancement ajoute une ligne dans l'onglet **Executions** (affiche
+**Exécutions** dans Sheets) du meme classeur : debut et fin en heure de Paris,
+competitions, statut, matchs exportes, ignores et en erreur, et detail d'erreur.
+L'onglet est cree automatiquement. Les lancements sans match eligible sont
+egalement enregistres. Une erreur de decouverte est indiquee dans le statut
+et le detail, sans etre comptee comme un match en erreur.
+Il s'agit d'un bilan de fin de lancement, pas d'une notification ni d'un statut
+en temps reel. Un arret brutal ou une panne d'acces Google peut empecher son
+enregistrement ; consulter alors le journal local.
 
 ## Validation hors ligne
 
@@ -118,7 +161,7 @@ nouvelle tentative du combo ; un second echec arrete le match.
 
 ```bash
 python3 -m unittest -q test_match_discovery test_flashscore_lineups \
-  test_name_matching test_master_odds_parser test_betclic_odds
+  test_name_matching test_master_odds_parser test_betclic_odds test_executions
 ```
 
 Certains tests utilisent Chromium localement sur des pages HTML de test.

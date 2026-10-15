@@ -207,6 +207,109 @@ class CacheTests(unittest.TestCase):
 
 
 class ManualAndPipelineTests(unittest.TestCase):
+    def test_official_only_is_opt_in_and_rejects_probable_flag(self):
+        self.assertFalse(parser.parse_args([]).official_lineups_only)
+        self.assertTrue(parser.parse_args(["--official-lineups-only"]).official_lineups_only)
+        with patch("sys.stderr"), self.assertRaises(SystemExit):
+            parser.parse_args(["--official-lineups-only", "--flashscore"])
+
+    def test_official_only_skips_absent_lineups_and_runs_confirmed_lineups(self):
+        frame = pd.DataFrame([
+            {"Match": "PSG - Marseille", "Equipe": team, "home": home,
+             "Taille Combi": 1, "Joueurs": name, "Cote PMU": 2.0}
+            for home, team, name in ((1, "PSG", "Alice"), (0, "Marseille", "Bob"))
+        ])
+        for lineups in (None, {1: [], 0: []}):
+            with self.subTest(lineups=lineups), \
+                    patch.object(parser, "datetime") as clock, \
+                    patch.object(parser, "get_pmu_players_dict", return_value=frame), \
+                    patch.object(parser, "get_match_lineups", return_value=lineups) as read, \
+                    patch.object(parser, "filter_players", return_value=frame), \
+                    patch.object(parser, "run_master_wina_and_pmu",
+                                 return_value=(frame, pd.DataFrame())) as wina, \
+                    patch.object(parser, "run_betclic_extraction") as betclic, \
+                    patch.object(parser, "export_to_google_sheets") as export:
+                clock.now.return_value = datetime(2026, 10, 15, 20, tzinfo=discovery.PARIS)
+                parser.process_single_match(
+                    123, 456, "", parser.parse_args(["--official-lineups-only"]), "key", 0,
+                    flashscore_url=fixture()["flashscore_url"], match_start=fixture()["start"],
+                )
+                self.assertFalse(read.call_args.kwargs["allow_probable"])
+                self.assertEqual(wina.call_count, 0 if lineups is None else 1)
+                self.assertEqual(export.call_count, 0 if lineups is None else 1)
+                betclic.assert_not_called()
+
+    def test_official_only_checks_kickoff_after_worker_delay(self):
+        with patch.object(parser, "datetime") as clock, \
+                patch.object(parser, "get_pmu_players_dict") as pmu, \
+                self.assertLogs(level="INFO") as logs:
+            clock.now.return_value = datetime(2026, 10, 15, 21, tzinfo=discovery.PARIS)
+            parser.process_single_match(
+                123, 456, "", parser.parse_args(["--official-lineups-only"]), "key", 0,
+                flashscore_url=fixture()["flashscore_url"], match_start=fixture()["start"],
+            )
+        pmu.assert_not_called()
+        self.assertIn("coup d'envoi", " ".join(logs.output))
+
+    def test_official_only_skips_when_kickoff_arrives_during_lineup_check(self):
+        frame = pd.DataFrame([{"Match": "PSG - Marseille", "home": 1}])
+        with patch.object(parser, "datetime") as clock, \
+                patch.object(parser, "get_pmu_players_dict", return_value=frame), \
+                patch.object(parser, "get_match_lineups", return_value={1: [], 0: []}), \
+                patch.object(parser, "filter_players", return_value=frame), \
+                patch.object(parser, "run_master_wina_and_pmu") as wina, \
+                patch.object(parser, "export_to_google_sheets") as export:
+            clock.now.side_effect = [
+                datetime(2026, 10, 15, 20, 59, tzinfo=discovery.PARIS),
+                datetime(2026, 10, 15, 21, tzinfo=discovery.PARIS),
+            ]
+            parser.process_single_match(
+                123, 456, "", parser.parse_args(["--official-lineups-only"]), "key", 0,
+                flashscore_url=fixture()["flashscore_url"], match_start=fixture()["start"],
+            )
+        wina.assert_not_called()
+        export.assert_not_called()
+
+    def test_official_only_does_not_hide_lineup_errors(self):
+        frame = pd.DataFrame([{"Match": "PSG - Marseille", "home": 1}])
+        with patch.object(parser, "datetime") as clock, \
+                patch.object(parser, "get_pmu_players_dict", return_value=frame), \
+                patch.object(parser, "get_match_lineups", side_effect=ValueError("Composition incomplete")), \
+                patch.object(parser, "run_master_wina_and_pmu") as wina, \
+                self.assertLogs(level="ERROR"), self.assertRaisesRegex(ValueError, "incomplete"):
+            clock.now.return_value = datetime(2026, 10, 15, 20, tzinfo=discovery.PARIS)
+            parser.process_single_match(
+                123, 456, "", parser.parse_args(["--official-lineups-only"]), "key", 0,
+                flashscore_url=fixture()["flashscore_url"], match_start=fixture()["start"],
+            )
+        wina.assert_not_called()
+
+    def test_official_only_main_excludes_started_matches_and_passes_start(self):
+        past = fixture()
+        future = dict(fixture(), event_pmu=789, start="2026-10-15T22:00:00+02:00")
+        with patch.object(parser, "datetime") as clock, \
+                patch.object(parser, "configure_logging"), \
+                patch.object(parser, "get_daily_matches", return_value=[past, future]), \
+                patch.object(parser, "export_execution"), \
+                patch.object(parser, "process_single_match", return_value="exported") as process:
+            clock.now.return_value = datetime(2026, 10, 15, 21, tzinfo=discovery.PARIS)
+            parser.main(["--official-lineups-only"])
+        process.assert_called_once()
+        self.assertEqual(process.call_args.args[0], 789)
+        self.assertEqual(process.call_args.kwargs["match_start"], future["start"])
+
+    def test_official_only_manual_csv_requires_date_and_direct_lineup_url(self):
+        args = parser.parse_args(["--file", "manual.csv", "--official-lineups-only"])
+        for extras in ({}, {"start": fixture()["start"]},
+                       {"flashscore_url": fixture()["flashscore_url"]},
+                       {"start": "2026-10-15T21:00:00", "flashscore_url": "url"}):
+            frame = pd.DataFrame([{"event_pmu": 123, "event_wina": 456,
+                                   "url_betclic": "", **extras}])
+            with self.subTest(extras=extras), \
+                    patch.object(parser.pd, "read_csv", return_value=frame), \
+                    self.assertRaises(ValueError):
+                parser.load_manual_matches(args)
+
     def test_manual_csv_uses_headers_and_preserves_blank_betclic(self):
         args = parser.parse_args(["--file", "manual.csv"])
         frame = pd.DataFrame([{"url_betclic": "", "event_wina": 456, "event_pmu": 123}])
@@ -241,7 +344,8 @@ class ManualAndPipelineTests(unittest.TestCase):
     def test_main_routes_discovered_records_without_running_other_matches(self):
         with patch.object(parser, "configure_logging"), \
                 patch.object(parser, "get_daily_matches", return_value=[fixture()]) as discover, \
-                patch.object(parser, "process_single_match") as process:
+                patch.object(parser, "export_execution"), \
+                patch.object(parser, "process_single_match", return_value="exported") as process:
             parser.main(["-c", "l1", "-m", "PSG", "--date", "2026-10-15"])
         self.assertEqual(discover.call_args.args[0], ["l1"])
         self.assertEqual(discover.call_args.kwargs["queries"], ["PSG"])

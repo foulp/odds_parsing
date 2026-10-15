@@ -49,7 +49,7 @@ import logging
 from flashscore_lineups import get_today_matches, get_match_lineups, filter_players
 from betclic_odds import extract_markets as extract_betclic_markets, build_results as build_betclic_results
 from name_matching import DEFAULT_MATCH_SCORE, match_names
-from match_discovery import COMPETITIONS, PARIS, get_daily_matches, select_matches
+from match_discovery import COMPETITIONS, PARIS, get_daily_matches, select_matches, local_start
 
 
 def configure_logging():
@@ -61,6 +61,26 @@ def configure_logging():
             logging.StreamHandler(),
         ],
     )
+
+def export_execution(summary):
+    header = ["Debut (Paris)", "Fin (Paris)", "Competitions", "Statut",
+              "Matchs exportes", "Matchs ignores", "Matchs en erreur", "Detail"]
+    book = gspread.service_account(filename="credentials.json").open(GSHEET_NAME)
+    try:
+        sheet = book.worksheet("Exécutions")
+    except gspread.exceptions.WorksheetNotFound:
+        sheet = book.add_worksheet(title="Exécutions", rows="1000", cols=str(len(header)))
+    existing_header = sheet.row_values(1)
+    if existing_header and existing_header != header:
+        raise ValueError("Colonnes incompatibles dans l'onglet Executions")
+    if not existing_header:
+        sheet.append_row(header, value_input_option="RAW")
+        sheet.freeze(rows=1)
+    sheet.append_row([
+        summary["start"], datetime.now(PARIS).strftime("%Y-%m-%d %H:%M:%S"),
+        summary["competitions"], summary["status"], summary["exported"],
+        summary["ignored"], summary["failed"], summary["detail"][:4000],
+    ], value_input_option="RAW")
 
 # ==========================================
 # 1. MODULE GOOGLE SHEETS
@@ -621,13 +641,20 @@ def run_betclic_extraction(url_match, df_pmu, headless=True, name_match_score=DE
 # ==========================================
 
 def process_single_match(event_pmu, event_wina, url_betclic, args, gsheet_credentials, delay,
-                         flashscore_matches=None, flashscore_url=None):
+                         flashscore_matches=None, flashscore_url=None, match_start=None):
     """Encapsule la logique d'un match avec un délai de démarrage anti-bot."""
     # Désynchronisation initiale pour éviter les pics de requêtes
     time.sleep(delay)
     match_label = f"PMU {event_pmu}"
     
     try:
+        official_only = args.official_lineups_only
+        if official_only:
+            if not flashscore_url or match_start is None:
+                raise ValueError("--official-lineups-only exige flashscore_url et start pour chaque match")
+            if local_start(match_start) <= datetime.now(PARIS):
+                logging.info("[%s] Match ignore : coup d'envoi deja atteint.", match_label)
+                return "ignored"
         logging.info("[%s] Recuperation du match PMU...", match_label)
         url_wina_full = f"https://www.winamax.fr/paris-sportifs/match/{event_wina}"
         
@@ -644,15 +671,19 @@ def process_single_match(event_pmu, event_wina, url_betclic, args, gsheet_creden
                 logging.info("[%s] Duree simples PMU : %.2fs", match_label, time.perf_counter() - started)
             if df_pmu_simples.empty:
                 logging.info("[%s] Fin : Pas de donnees PMU.", match_label)
-                return
+                return "ignored"
 
             if flashscore_url or flashscore_matches is not None or args.flashscore:
                 nb_avant = len(df_pmu_simples)
                 with timed_stage(match_label, "compositions Flashscore"):
                     lineups = get_match_lineups(
                         flashscore_matches, df_pmu_simples, args.headless,
-                        allow_probable=args.flashscore, url=flashscore_url,
+                        allow_probable=args.flashscore and not official_only, url=flashscore_url,
                     )
+                    if lineups is None and official_only:
+                        logging.info("[%s] Match ignore : compositions officielles non annoncees.",
+                                     match_label)
+                        return "ignored"
                     if lineups is not None:
                         df_pmu_simples = filter_players(df_pmu_simples, lineups)
                 if lineups is not None:
@@ -662,6 +693,10 @@ def process_single_match(event_pmu, event_wina, url_betclic, args, gsheet_creden
                 logging.warning("[%s] Aucune reference Flashscore fournie en mode manuel ; aucun filtre.",
                                 match_label)
 
+            if official_only and local_start(match_start) <= datetime.now(PARIS):
+                logging.info("[%s] Match ignore : coup d'envoi atteint pendant la verification.",
+                             match_label)
+                return "ignored"
             with timed_stage(match_label, "pipeline Wina et combinaisons"):
                 df_pmu_final, df_wina = run_master_wina_and_pmu(
                     url_wina_full, event_pmu, df_pmu_simples, args.tailles,
@@ -691,6 +726,7 @@ def process_single_match(event_pmu, event_wina, url_betclic, args, gsheet_creden
         with timed_stage(match_label, "export Google Sheets"):
             export_to_google_sheets(df_final, gsheet_credentials, GSHEET_NAME, df_final.iloc[0]['Match'])
         logging.info("[%s] Termine avec succes.", match_label)
+        return "exported"
         
     except Exception:
         logging.exception("[%s] ERREUR GLOBALE", match_label)
@@ -728,6 +764,8 @@ def parse_args(argv=None):
                         help="Navigateur masque par defaut ; --no-headless pour l'afficher")
     parser.add_argument("--flashscore", action="store_true",
                         help="Accepter aussi les compositions probables (officielles seules par defaut)")
+    parser.add_argument("--official-lineups-only", action="store_true",
+                        help="Analyser seulement les matchs a venir avec compositions officielles completes")
     
     args = parser.parse_args(argv)
     if any(taille < 2 for taille in args.tailles):
@@ -736,6 +774,8 @@ def parse_args(argv=None):
         parser.error("--refresh-matches ne s'applique pas au mode --file")
     if args.file and args.date is not None:
         parser.error("--date ne s'applique pas au mode --file")
+    if args.official_lineups_only and args.flashscore:
+        parser.error("--official-lineups-only est incompatible avec --flashscore (compositions probables)")
     return args
 
 
@@ -761,14 +801,16 @@ def load_manual_matches(args):
             if row[key] <= 0:
                 raise ValueError(f"CSV : {key} doit etre positif")
         row["url_betclic"] = str(row["url_betclic"]).strip()
+        if args.official_lineups_only:
+            if not row.get("flashscore_url") or not row.get("start"):
+                raise ValueError("--official-lineups-only exige les colonnes CSV flashscore_url et start remplies")
+            local_start(row["start"])
         row.setdefault("competition", "manuel")
         records.append(row)
     return select_matches(records, args.match)
 
 
-def main(argv=None):
-    args = parse_args(argv)
-    configure_logging()
+def run_matches(args, summary):
     if args.file:
         matches = load_manual_matches(args)
         need_calendar = args.flashscore and any(not r.get("flashscore_url") for r in matches)
@@ -785,6 +827,22 @@ def main(argv=None):
     if not matches:
         logging.info("Aucun match a analyser dans le perimetre selectionne.")
         return
+    if args.official_lineups_only:
+        now = datetime.now(PARIS)
+        upcoming = []
+        for row in matches:
+            if not row.get("flashscore_url") or not row.get("start"):
+                raise ValueError("--official-lineups-only exige flashscore_url et start pour chaque match")
+            if local_start(row["start"]) <= now:
+                summary["ignored"] += 1
+                logging.info("[%s - %s] Match ignore : coup d'envoi deja atteint.",
+                             row.get("home", row["event_pmu"]), row.get("away", ""))
+            else:
+                upcoming.append(row)
+        matches = upcoming
+        if not matches:
+            logging.info("Aucun match a venir a analyser.")
+            return
         
     GSHEET_CREDENTIALS = "credentials.json"
     
@@ -802,15 +860,48 @@ def main(argv=None):
                 process_single_match, 
                 row["event_pmu"], row["event_wina"], row["url_betclic"],
                 args, GSHEET_CREDENTIALS, jitter, flashscore_matches, row.get("flashscore_url") or None,
+                **({"match_start": row["start"]} if args.official_lineups_only else {}),
             ))
             
         failed = False
         for future in as_completed(futures):
             if future.exception() is not None:
                 failed = True
+                summary["failed"] += 1
                 logging.error(f"Un thread a planté : {future.exception()}")
+                summary["detail"] += f"{future.exception()}\n"
+            else:
+                result = future.result()
+                if result not in ("exported", "ignored"):
+                    raise ValueError(f"Resultat de traitement inattendu : {result!r}")
+                summary[result] += 1
         if failed:
             raise SystemExit(1)
+
+def main(argv=None):
+    args = parse_args(argv)
+    configure_logging()
+    summary = {
+        "start": datetime.now(PARIS).strftime("%Y-%m-%d %H:%M:%S"),
+        "competitions": ", ".join(args.competition or (["CSV manuel"] if args.file else COMPETITIONS)),
+        "status": "Termine", "exported": 0, "ignored": 0, "failed": 0, "detail": "",
+    }
+    try:
+        run_matches(args, summary)
+    except (Exception, SystemExit) as exc:
+        summary["status"] = "Termine avec erreurs"
+        if not summary["detail"]:
+            summary["detail"] = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        if summary["status"] == "Termine" and not summary["exported"]:
+            summary["status"] = "Aucun match exporte"
+        try:
+            export_execution(summary)
+        except Exception:
+            logging.exception("[GSHEETS] Echec d'enregistrement du bilan d'execution")
+            if summary["status"] != "Termine avec erreurs":
+                raise
 
 
 GSHEET_NAME = "Joueur décisif PMU/WINA/Betclic"

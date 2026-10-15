@@ -622,7 +622,7 @@ class SheetsTests(unittest.TestCase):
     def test_match_failure_is_not_reported_as_success(self):
         args = argparse.Namespace(
             tailles=[2], cote_out=4, ratio_min=1.15,
-            name_match_score=85, headless=True, flashscore=False,
+            name_match_score=85, headless=True, flashscore=False, official_lineups_only=False,
         )
         singles = players_frame()
         with patch.object(parser, "GSHEET_NAME", "book", create=True), \
@@ -637,7 +637,7 @@ class SheetsTests(unittest.TestCase):
     def test_final_export_preserves_columns_ratios_and_sort_order(self):
         args = argparse.Namespace(
             tailles=[2], cote_out=4, ratio_min=1.15,
-            name_match_score=85, headless=True, flashscore=False,
+            name_match_score=85, headless=True, flashscore=False, official_lineups_only=False,
         )
         singles = players_frame()
         wina = pd.DataFrame([
