@@ -259,19 +259,21 @@ class BrowserTests(unittest.TestCase):
     def test_quote_refreshes_buttons_and_waits_for_empty_basket(self):
         page = MagicMock()
         basket = page.locator.return_value
-        basket.locator.return_value.first.inner_text.return_value = "6,5"
+        items = basket.locator.return_value
+        items.locator.return_value.first.inner_text.return_value = "6,5"
         alice, bob = MagicMock(), MagicMock()
         with patch.object(parser, "extract_wina_players",
                           return_value=({"Alice": alice, "Bob": bob}, [])) as extract, \
+                patch.object(parser, "expect") as assertion, \
                 patch.object(parser.time, "sleep"):
             self.assertEqual(parser.read_wina_combination(page, "tables", ["Alice", "Bob"]), 6.5)
-        extract.assert_called_once_with("tables")
+        self.assertEqual(extract.call_count, 2)
+        extract.assert_called_with("tables")
         alice.click.assert_called_once_with(force=True, timeout=10000)
         bob.click.assert_called_once_with(force=True, timeout=10000)
-        basket.get_by_text.return_value.wait_for.assert_called_once_with(
-            state="visible", timeout=10000,
-        )
-        basket.locator.assert_called_with(".odds-indicator-value > div")
+        self.assertEqual(basket.get_by_text.return_value.wait_for.call_count, 2)
+        items.locator.assert_any_call(".odds-indicator-value > div")
+        self.assertEqual(assertion.return_value.to_have_text.call_count, 5)
 
     def test_clear_uses_named_control_not_arbitrary_svg(self):
         page = MagicMock()
@@ -420,21 +422,96 @@ class LocalDomTests(unittest.TestCase):
     def test_quote_reads_final_value_not_animation_history(self):
         with parser.wina_page(True) as page:
             page.set_content("""
-                <button id="alice">Alice</button><button id="bob">Bob</button>
+                <button id="alice" onclick="add('Alice')">Alice</button>
+                <button id="bob" onclick="add('Bob')">Bob</button>
                 <div data-testid="sticky-wrap">
+                  <div data-testid="basket-item-match" hidden>
                     <div class="odds-indicator-value">
                         <span><span>0,26</span><span>0,52</span><span>6,50</span></span>
                         <div>6,50</div>
                     </div>
+                    <div id="players"></div>
+                  </div>
                     <div role="button" aria-label="Effacer et continuer"
                          onclick="document.querySelector('#empty').hidden=false">Vider</div>
-                    <div id="empty" hidden>Ton panier est vide !</div>
+                    <div id="empty">Ton panier est vide !</div>
                 </div>
+                <script>
+                  function add(name) {
+                    document.querySelector('#empty').hidden=true;
+                    document.querySelector('[data-testid="basket-item-match"]').hidden=false;
+                    const row=document.createElement('div');
+                    row.innerHTML='<span>Joueur décisif</span><span> '+name+'</span>';
+                    document.querySelector('#players').append(row);
+                  }
+                </script>
             """)
             with patch.object(parser, "extract_wina_players", return_value=(
                 {"Alice": page.locator("#alice"), "Bob": page.locator("#bob")}, [],
             )):
                 self.assertEqual(parser.read_wina_combination(page, None, ["Alice", "Bob"]), 6.5)
+
+    def test_quote_waits_for_delayed_duo_and_trio_instead_of_reading_single(self):
+        for names in (["Alice", "Bob"], ["Alice", "Bob", "Chris"]):
+            with self.subTest(names=names), parser.wina_page(True) as page:
+                page.set_content("""
+                    <button id="Alice" onclick="add('Alice')">Alice</button>
+                    <button id="Bob" onclick="add('Bob')">Bob</button>
+                    <button id="Chris" onclick="add('Chris')">Chris</button>
+                    <div data-testid="sticky-wrap">
+                      <div id="empty">Ton panier est vide !</div>
+                      <div data-testid="basket-item-match" hidden>
+                        <div id="players"></div>
+                        <div class="odds-indicator-value"><div>3,20</div></div>
+                      </div>
+                      <div role="button" aria-label="Effacer et continuer"
+                        onclick="document.querySelector('#empty').hidden=false">Vider</div>
+                    </div>
+                    <script>
+                      let timer;
+                      function add(name) {
+                        clearTimeout(timer);
+                        document.querySelector('#empty').hidden=true;
+                        document.querySelector('[data-testid="basket-item-match"]').hidden=false;
+                        setTimeout(() => {
+                          const row=document.createElement('div');
+                          row.innerHTML='<span>Joueur décisif</span><span> '+name+'</span>';
+                          document.querySelector('#players').append(row);
+                        }, 200);
+                        timer=setTimeout(() => {
+                          document.querySelector('.odds-indicator-value > div').textContent='9,00';
+                        }, 1000);
+                      }
+                    </script>
+                """)
+                with patch.object(parser, "extract_wina_players", side_effect=lambda _: (
+                    {name: page.locator(f"#{name}") for name in names}, [],
+                )):
+                    self.assertEqual(parser.read_wina_combination(page, None, names), 9.0)
+
+    def test_incorrect_basket_never_returns_the_visible_single_odds(self):
+        with parser.wina_page(True) as page:
+            page.set_content("""
+                <button id="alice" onclick="add()">Alice</button>
+                <button id="bob">Bob</button>
+                <div data-testid="sticky-wrap">
+                  <div id="empty">Ton panier est vide !</div>
+                  <div data-testid="basket-item-match" hidden>
+                    <div><span>Joueur décisif</span><span> Alice</span></div>
+                    <div class="odds-indicator-value"><div>3,20</div></div>
+                  </div>
+                </div>
+                <script>
+                  function add() {
+                    document.querySelector('#empty').hidden=true;
+                    document.querySelector('[data-testid="basket-item-match"]').hidden=false;
+                  }
+                </script>
+            """)
+            with patch.object(parser, "extract_wina_players", return_value=(
+                {"Alice": page.locator("#alice"), "Bob": page.locator("#bob")}, [],
+            )), self.assertRaises(AssertionError):
+                parser.read_wina_combination(page, None, ["Alice", "Bob"])
 
     def test_extracts_real_dom_and_targets_decisive_player_buttons(self):
         teams = []

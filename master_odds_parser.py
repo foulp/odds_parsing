@@ -38,6 +38,7 @@ from contextlib import contextmanager, nullcontext
 from itertools import combinations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import random
+import re
 import gspread
 from gspread_dataframe import set_with_dataframe
 from playwright.sync_api import sync_playwright, expect, Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
@@ -453,30 +454,47 @@ def clear_wina_basket(page):
 
 
 def read_wina_combination(page, tableaux, names):
-    # Les indices peuvent changer lors des mises a jour du marche.
-    buttons, _ = extract_wina_players(tableaux)
-    missing = set(names) - buttons.keys()
-    if missing:
-        raise ValueError(f"Joueurs Winamax absents : {sorted(missing)}")
+    if len(names) < 2 or len(set(names)) != len(names):
+        raise ValueError(f"Combinaison Winamax invalide : {names}")
+    clear_wina_basket(page)
     basket = page.locator("div[data-testid='sticky-wrap']")
+    items = basket.locator('[data-testid^="basket-item-"]')
+    # Un MyMatch est un seul item contenant une ligne par joueur.
+    rows = items.locator("span").filter(
+        has_text=re.compile(r"^Joueur décisif$"),
+    ).locator("xpath=..")
+    expected_rows = []
     for name in names:
+        buttons, _ = extract_wina_players(tableaux)
+        if name not in buttons:
+            raise ValueError(f"Joueur Winamax absent : {name}")
         buttons[name].click(force=True, timeout=10000)
-        time.sleep(0.3)
+        expected_rows.append(re.compile(r"^Joueur décisif\s*(?:-\s*)?" + re.escape(name) + r"$"))
+        expect(items).to_have_count(1, timeout=10000)
+        expect(rows).to_have_text(expected_rows, timeout=10000)
 
     odds = None
-    for _ in range(5):
+    stable_reads = 0
+    for _ in range(20):
         time.sleep(0.5)
+        expect(items).to_have_count(1, timeout=10000)
+        expect(rows).to_have_text(expected_rows, timeout=10000)
         # Le span anime contient aussi les valeurs intermediaires.
-        value = basket.locator(".odds-indicator-value > div").first
+        value = items.locator(".odds-indicator-value > div").first
         if value.count() and value.is_visible():
             try:
                 candidate = float(value.inner_text().strip().replace(",", "."))
             except ValueError:
+                odds, stable_reads = None, 0
                 continue
             if np.isfinite(candidate) and candidate > 0:
+                stable_reads = stable_reads + 1 if candidate == odds else 1
                 odds = candidate
-                break
-    if odds is None:
+                if stable_reads >= 3:
+                    break
+                continue
+        odds, stable_reads = None, 0
+    if odds is None or stable_reads < 3:
         raise ValueError(f"Cote Winamax indisponible pour {names}")
 
     clear_wina_basket(page)
@@ -571,7 +589,7 @@ def run_master_wina_and_pmu(url_match, event_id_pmu, df_pmu_simples, tailles_com
                             "Cote Wina": match_cote
                         })
                         break
-                    except (PlaywrightError, ValueError) as exc:
+                    except (PlaywrightError, ValueError, AssertionError) as exc:
                         logging.warning("[%s] Echec tentative %s/2 pour %s : %s",
                                         nom_match_log, attempt + 1, cle_universelle_pmu, exc)
                         if attempt == 1:

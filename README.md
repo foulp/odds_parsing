@@ -109,6 +109,13 @@ selectionnees ; pour une competition differente, fournir `flashscore_url`.
 
 ## Validation hors ligne
 
+Pour les combinaisons Winamax, le panier est vide avant chaque calcul. Chaque
+clic est confirme par le nombre et les noms exacts des lignes Joueur decisif
+dans l'unique item MyMatch (le compteur global peut afficher une seule selection
+pour un duo ou un trio). La cote finale doit etre stable sur trois lectures
+espacees de 0,5 seconde. Une incoherence declenche la reconstruction et une
+nouvelle tentative du combo ; un second echec arrete le match.
+
 ```bash
 python3 -m unittest -q test_match_discovery test_flashscore_lineups \
   test_name_matching test_master_odds_parser test_betclic_odds
