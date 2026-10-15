@@ -47,6 +47,11 @@ Les quotas et la facturation GitHub Actions dependent de l'offre du depot.
 Les sites peuvent bloquer les IP des runners GitHub : le premier essai sert
 a verifier cet acces, qui ne peut pas etre garanti par les tests hors ligne.
 Un echec ne doit pas etre interprete comme une absence de cotes.
+Si Winamax ne charge pas les donnees de competition, le journal et les artifacts
+incluent un diagnostic JSON : statut HTTP de navigation, URL finale, titre,
+presence des donnees attendues et debut du texte visible de la page publique.
+Cela permet de distinguer une redirection, un refus d'acces et un chargement
+incomplet sans conclure a un blocage sur la seule base d'un timeout.
 Les compositions officielles restent filtrees uniquement si elles sont publiees.
 
 Le meme mode de test est disponible localement :

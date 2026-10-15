@@ -4,3 +4,4 @@ __pycache__/
 scraping.log
 credentials.json
 results/
+diagnostics/

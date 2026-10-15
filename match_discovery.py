@@ -90,11 +90,36 @@ def read_pmu_matches(session, competition, today):
 def read_winamax_matches(page, competition, today):
     url = COMPETITIONS[competition]["winamax"]
     tournament = int(url.rstrip("/").split("/")[-1])
-    page.goto(url, wait_until="domcontentloaded")
-    page.wait_for_function(
-        "id => !!window.PRELOADED_STATE?.tournaments?.[id] && !!window.PRELOADED_STATE?.matches",
-        arg=tournament, timeout=20000,
-    )
+    response = page.goto(url, wait_until="domcontentloaded")
+    try:
+        page.wait_for_function(
+            "id => !!window.PRELOADED_STATE?.tournaments?.[id] && !!window.PRELOADED_STATE?.matches",
+            arg=tournament, timeout=20000,
+        )
+    except PlaywrightTimeoutError as exc:
+        diagnostic = page.evaluate("""id => ({
+            url: location.href,
+            title: document.title,
+            readyState: document.readyState,
+            hasState: !!window.PRELOADED_STATE,
+            hasTournament: !!window.PRELOADED_STATE?.tournaments?.[id],
+            hasMatches: !!window.PRELOADED_STATE?.matches,
+            text: (document.body?.innerText || '').slice(0, 2000)
+        })""", tournament)
+        diagnostic["status"] = response.status if response is not None else None
+        logging.error("[DECOUVERTE] Winamax %s : donnees non chargees ; diagnostic=%s",
+                      competition, json.dumps(diagnostic, ensure_ascii=True))
+        output = Path("diagnostics") / f"winamax-{competition}.json"
+        try:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps(diagnostic, ensure_ascii=True, indent=2), encoding="utf-8")
+        except OSError:
+            logging.exception("[DECOUVERTE] Impossible d'enregistrer le diagnostic Winamax")
+        raise RuntimeError(
+            f"Winamax {competition} : donnees de competition non chargees apres 20 s "
+            f"(HTTP {diagnostic['status']}). Blocage, redirection ou chargement incomplet possible ; "
+            "consulter le diagnostic dans scraping.log ou les artifacts. Aucun match ignore."
+        ) from exc
     events = page.evaluate(
         "id => Object.values(window.PRELOADED_STATE.matches).filter(m => m.tournamentId === id)",
         tournament,
