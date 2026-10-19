@@ -5,6 +5,8 @@ Sans --file, les matchs du jour sont decouverts dans ldc, l1 et pl (Europe/Paris
 -c/--competition selectionne les competitions ; -m/--match cible des rencontres.
 --file conserve le mode CSV manuel. Les references automatiques sont mises en cache
 par jour dans .match-cache ; --refresh-matches renouvelle leur decouverte.
+--scheduled reserve l'analyse aux 90 minutes avant le match, impose les compositions
+officielles et memorise les exports reussis pour les passages periodiques suivants.
 Les compositions officielles filtrent les 10 joueurs de champ par defaut.
 --flashscore accepte aussi les compositions probables ; une absence ne filtre pas.
 Toutes les combinaisons eligibles sont generees dans l'ordre domicile/exterieur puis tailles.
@@ -50,6 +52,8 @@ from flashscore_lineups import get_today_matches, get_match_lineups, filter_play
 from betclic_odds import extract_markets as extract_betclic_markets, build_results as build_betclic_results
 from name_matching import DEFAULT_MATCH_SCORE, match_names
 from match_discovery import COMPETITIONS, PARIS, get_daily_matches, select_matches, local_start
+from scheduled_runs import ExportedMatches, run_lock
+from sheets_cleanup import cleanup_match_sheets, track_match_sheet
 
 
 def configure_logging():
@@ -81,11 +85,13 @@ def export_execution(summary):
         summary["competitions"], summary["status"], summary["exported"],
         summary["ignored"], summary["failed"], summary["detail"][:4000],
     ], value_input_option="RAW")
+    sheet.sort((1, "des"), (2, "des"), range="A2:H" + str(sheet.row_count))
 
 # ==========================================
 # 1. MODULE GOOGLE SHEETS
 # ==========================================
-def export_to_google_sheets(df, json_key_path, spreadsheet_name, sheet_name="Feuille 1"):
+def export_to_google_sheets(df, json_key_path, spreadsheet_name, sheet_name="Feuille 1",
+                           match_start=None):
     logging.info(f"[GSHEETS] Connexion avec {json_key_path} pour l'onglet '{sheet_name}'...")
     if df.empty:
         logging.info("[GSHEETS] Le DataFrame est vide, annulation de l'export.")
@@ -99,11 +105,13 @@ def export_to_google_sheets(df, json_key_path, spreadsheet_name, sheet_name="Feu
         gc = gspread.service_account(filename=json_key_path)
         sh = gc.open(spreadsheet_name)
         
+        created = False
         try:
             worksheet = sh.worksheet(sheet_name)
         except gspread.exceptions.WorksheetNotFound:
             logging.info(f"[GSHEETS] L'onglet '{sheet_name}' n'existe pas. Création en cours...")
             worksheet = sh.add_worksheet(title=sheet_name, rows="1000", cols="20")
+            created = True
         
         # La colonne A contient l'horodatage de chaque ligne exportee.
         timestamps = worksheet.col_values(1)
@@ -214,6 +222,8 @@ def export_to_google_sheets(df, json_key_path, spreadsheet_name, sheet_name="Feu
 
         # Envoi de la requête globale (mise à l'échelle + tous les dégradés)
         sh.batch_update(body)
+        if match_start is not None:
+            track_match_sheet(sh.id, worksheet.id, sheet_name, match_start, created)
 
         logging.info(f"[GSHEETS] Succès : {len(df_export)} lignes ajoutées à '{spreadsheet_name} -> {sheet_name}'.")
         
@@ -489,7 +499,8 @@ def read_wina_combination(page, tableaux, names):
         if name not in buttons:
             raise ValueError(f"Joueur Winamax absent : {name}")
         buttons[name].click(force=True, timeout=10000)
-        expected_rows.append(re.compile(r"^Joueur décisif\s*(?:-\s*)?" + re.escape(name) + r"$"))
+        expected_name = r"\s+".join(re.escape(word) for word in name.split())
+        expected_rows.append(re.compile(r"^\s*Joueur décisif\s*(?:-\s*)?" + expected_name + r"\s*$"))
         expect(items).to_have_count(1, timeout=10000)
         expect(rows).to_have_text(expected_rows, timeout=10000)
 
@@ -724,7 +735,10 @@ def process_single_match(event_pmu, event_wina, url_betclic, args, gsheet_creden
         df_final = df_final.drop(columns=['home'], errors='ignore')
             
         with timed_stage(match_label, "export Google Sheets"):
-            export_to_google_sheets(df_final, gsheet_credentials, GSHEET_NAME, df_final.iloc[0]['Match'])
+            export_to_google_sheets(
+                df_final, gsheet_credentials, GSHEET_NAME, df_final.iloc[0]['Match'],
+                **({"match_start": match_start} if match_start is not None else {}),
+            )
         logging.info("[%s] Termine avec succes.", match_label)
         return "exported"
         
@@ -766,6 +780,8 @@ def parse_args(argv=None):
                         help="Accepter aussi les compositions probables (officielles seules par defaut)")
     parser.add_argument("--official-lineups-only", action="store_true",
                         help="Analyser seulement les matchs a venir avec compositions officielles completes")
+    parser.add_argument("--scheduled", action="store_true",
+                        help="Passage periodique : 90 minutes avant le match, compositions officielles, sans reexport")
     
     args = parser.parse_args(argv)
     if any(taille < 2 for taille in args.tailles):
@@ -774,6 +790,10 @@ def parse_args(argv=None):
         parser.error("--refresh-matches ne s'applique pas au mode --file")
     if args.file and args.date is not None:
         parser.error("--date ne s'applique pas au mode --file")
+    if args.scheduled:
+        if args.file or args.date is not None:
+            parser.error("--scheduled exige les matchs automatiques du jour (sans --file ni --date)")
+        args.official_lineups_only = True
     if args.official_lineups_only and args.flashscore:
         parser.error("--official-lineups-only est incompatible avec --flashscore (compositions probables)")
     return args
@@ -811,6 +831,7 @@ def load_manual_matches(args):
 
 
 def run_matches(args, summary):
+    exported_matches = ExportedMatches() if args.scheduled else None
     if args.file:
         matches = load_manual_matches(args)
         need_calendar = args.flashscore and any(not r.get("flashscore_url") for r in matches)
@@ -837,6 +858,13 @@ def run_matches(args, summary):
                 summary["ignored"] += 1
                 logging.info("[%s - %s] Match ignore : coup d'envoi deja atteint.",
                              row.get("home", row["event_pmu"]), row.get("away", ""))
+            elif exported_matches is not None and exported_matches.contains(row["event_pmu"]):
+                summary["ignored"] += 1
+                logging.info("[PMU %s] Match ignore : deja exporte.", row["event_pmu"])
+            elif args.scheduled and local_start(row["start"]) > now + timedelta(minutes=90):
+                summary["ignored"] += 1
+                logging.info("[PMU %s] Match ignore : coup d'envoi dans plus de 90 minutes.",
+                             row["event_pmu"])
             else:
                 upcoming.append(row)
         matches = upcoming
@@ -852,46 +880,74 @@ def run_matches(args, summary):
     logging.info(f"Lancement du traitement par lots ({len(matches)} matchs, {MAX_WORKERS} processus simultanés)...")
     
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = []
+        futures = {}
         for index, row in enumerate(matches):
             jitter = index * random.uniform(3.0, 7.0)
             
-            futures.append(executor.submit(
+            future = executor.submit(
                 process_single_match, 
                 row["event_pmu"], row["event_wina"], row["url_betclic"],
                 args, GSHEET_CREDENTIALS, jitter, flashscore_matches, row.get("flashscore_url") or None,
-                **({"match_start": row["start"]} if args.official_lineups_only else {}),
-            ))
+                **({"match_start": row["start"]} if row.get("start") else {}),
+            )
+            futures[future] = row
             
         failed = False
         for future in as_completed(futures):
+            row = futures[future]
+            match_label = (f"{row['home']} - {row['away']}"
+                           if row.get("home") and row.get("away")
+                           else f"PMU {row['event_pmu']} / Winamax {row['event_wina']}")
             if future.exception() is not None:
                 failed = True
                 summary["failed"] += 1
-                logging.error(f"Un thread a planté : {future.exception()}")
-                summary["detail"] += f"{future.exception()}\n"
+                error = future.exception()
+                logging.error("[%s] Echec du traitement : %s", match_label, error)
+                summary["detail"] += f"Erreur : {match_label} : {type(error).__name__}: {error}\n"
             else:
                 result = future.result()
                 if result not in ("exported", "ignored"):
                     raise ValueError(f"Resultat de traitement inattendu : {result!r}")
                 summary[result] += 1
+                if result == "exported":
+                    summary["detail"] += f"Exporte : {match_label}\n"
+                if result == "exported" and exported_matches is not None:
+                    try:
+                        exported_matches.mark_exported(futures[future]["event_pmu"])
+                    except OSError as exc:
+                        failed = True
+                        summary["failed"] += 1
+                        detail = f"{match_label} : export effectue mais non memorise : {exc}"
+                        summary["detail"] += f"{detail}\n"
+                        logging.exception("[PLANIFICATION] %s ; risque de doublon au prochain passage.", detail)
         if failed:
             raise SystemExit(1)
 
 def main(argv=None):
     args = parse_args(argv)
     configure_logging()
+    with run_lock() as acquired:
+        if acquired:
+            execute_run(args)
+
+
+def execute_run(args):
     summary = {
         "start": datetime.now(PARIS).strftime("%Y-%m-%d %H:%M:%S"),
         "competitions": ", ".join(args.competition or (["CSV manuel"] if args.file else COMPETITIONS)),
         "status": "Termine", "exported": 0, "ignored": 0, "failed": 0, "detail": "",
     }
     try:
+        if args.scheduled:
+            cleanup_match_sheets(
+                lambda: gspread.service_account(filename="credentials.json").open(GSHEET_NAME),
+                datetime.now(PARIS).date(),
+            )
         run_matches(args, summary)
     except (Exception, SystemExit) as exc:
         summary["status"] = "Termine avec erreurs"
-        if not summary["detail"]:
-            summary["detail"] = f"{type(exc).__name__}: {exc}"
+        if not isinstance(exc, SystemExit) or not summary["detail"]:
+            summary["detail"] += f"{type(exc).__name__}: {exc}\n"
         raise
     finally:
         if summary["status"] == "Termine" and not summary["exported"]:

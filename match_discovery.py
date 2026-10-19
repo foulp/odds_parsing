@@ -152,6 +152,9 @@ def read_betclic_matches(page, competition, today):
     for card in cards:
         if not re.search(r"-m\d+(?:$|[/?#])", card["url"]):
             continue
+        if normalize_name(card["date"]) == "maintenant":
+            logging.info("[DECOUVERTE] Betclic : rencontre en direct ignoree : %s", card["url"])
+            continue
         if betclic_date(card["date"], now) != today:
             continue
         teams = card["title"].split(" - ")

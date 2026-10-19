@@ -489,6 +489,37 @@ class LocalDomTests(unittest.TestCase):
                 )):
                     self.assertEqual(parser.read_wina_combination(page, None, names), 9.0)
 
+    def test_quote_accepts_basket_padding_but_still_checks_exact_player_names(self):
+        with parser.wina_page(True) as page:
+            page.set_content("""
+                <button id="enzo" onclick="add('Enzo&nbsp;Le Fée')">Enzo</button>
+                <button id="nordi" onclick="add('Nordi Mukiele ')">Nordi</button>
+                <div data-testid="sticky-wrap">
+                  <div id="empty">Ton panier est vide !</div>
+                  <div data-testid="basket-item-match" hidden>
+                    <div id="players"></div>
+                    <div class="odds-indicator-value"><div>9,00</div></div>
+                  </div>
+                  <div role="button" aria-label="Effacer et continuer"
+                    onclick="document.querySelector('#empty').hidden=false">Vider</div>
+                </div>
+                <script>
+                  function add(name) {
+                    document.querySelector('#empty').hidden=true;
+                    document.querySelector('[data-testid="basket-item-match"]').hidden=false;
+                    const row=document.createElement('div');
+                    row.innerHTML='<span>Joueur décisif</span><span>&nbsp;'+name+'</span>';
+                    document.querySelector('#players').append(row);
+                  }
+                </script>
+            """)
+            with patch.object(parser, "extract_wina_players", return_value=(
+                {"Enzo Le Fée": page.locator("#enzo"), "Nordi Mukiele": page.locator("#nordi")}, [],
+            )):
+                self.assertEqual(
+                    parser.read_wina_combination(page, None, ["Enzo Le Fée", "Nordi Mukiele"]), 9.0,
+                )
+
     def test_incorrect_basket_never_returns_the_visible_single_odds(self):
         with parser.wina_page(True) as page:
             page.set_content("""
@@ -551,6 +582,28 @@ class SheetsTests(unittest.TestCase):
         self.worksheet = self.sheet.worksheet.return_value
         self.worksheet.id = 42
         self.worksheet.row_values.return_value = ["Heure", *self.frame.columns.tolist()]
+
+    def test_successful_new_sheet_with_kickoff_is_registered_for_cleanup(self):
+        self.sheet.worksheet.side_effect = parser.gspread.exceptions.WorksheetNotFound("missing")
+        worksheet = self.sheet.add_worksheet.return_value
+        worksheet.id = 43
+        worksheet.col_values.return_value = []
+        start = "2026-10-19T21:00:00+02:00"
+        with patch.object(parser, "set_with_dataframe"), \
+                patch.object(parser, "track_match_sheet") as track:
+            parser.export_to_google_sheets(self.frame, "key.json", "book", "match",
+                                           match_start=start)
+        track.assert_called_once_with(self.sheet.id, 43, "match", start, True)
+
+    def test_failed_export_is_not_registered_for_cleanup(self):
+        self.worksheet.col_values.return_value = []
+        self.sheet.batch_update.side_effect = RuntimeError("quota")
+        with patch.object(parser, "set_with_dataframe"), \
+                patch.object(parser, "track_match_sheet") as track, \
+                self.assertLogs(level="ERROR"), self.assertRaisesRegex(RuntimeError, "quota"):
+            parser.export_to_google_sheets(self.frame, "key.json", "book", "match",
+                                           match_start="2026-10-19T21:00:00+02:00")
+        track.assert_not_called()
 
     def test_betclic_and_winamax_have_identical_gradients_per_combination_size(self):
         for betclic_only in (False, True):

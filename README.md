@@ -114,6 +114,70 @@ Pour la Premier League, remplacer `-c l1` par `-c pl`.
 Sans cette option, le comportement habituel est conserve. Elle ne memorise pas
 les matchs deja exportes : deux lancements avant le coup d'envoi avec les
 compositions publiees ajoutent tous deux des lignes dans Sheets.
+Un lancement ponctuel ne surveille pas l'arrivee des compositions : si elles
+ne sont pas publiees a cet instant, il faut relancer avant le coup d'envoi.
+Prevoir plusieurs passages dans l'heure qui precede les rencontres plutot
+qu'un unique passage exactement une heure avant ; des passages repetes peuvent
+cependant dupliquer les exports des matchs deja traites.
+
+### Passages automatiques toutes les 15 minutes
+
+```bash
+python3 master_odds_parser.py --scheduled -c l1 pl
+```
+
+Ce mode effectue un seul passage puis se termine. Il utilise le cache quotidien
+et ne traite que les rencontres dont le coup d'envoi est strictement a venir,
+dans les **90 prochaines minutes incluses**. Il impose les compositions
+officielles completes : sans elles, le match attend le prochain passage.
+Sans rencontre eligible, aucun navigateur d'analyse n'est ouvert ; le premier
+passage du jour peut toutefois ouvrir le navigateur pour decouvrir les references.
+Le bilan dans l'onglet Executions necessite toujours un acces Google.
+
+Les exports reussis sont memorises sur disque dans `.match-cache/exported.json`,
+par identifiant PMU. Ils ne sont plus analyses par les passages `--scheduled`
+suivants, meme apres redemarrage du PC. Les absences de composition et les erreurs
+ne sont pas memorisees comme des succes : elles sont retentees au prochain
+passage, tant que le match n'a pas commence. Les cotes et compositions ne sont
+pas mises en cache. Un etat d'exports invalide provoque une erreur explicite.
+
+Le succes est enregistre apres le retour de l'export Sheets. Un arret brutal
+entre l'ecriture Sheets et la sauvegarde locale, ou un export partiellement
+effectue avant une erreur Google, peut encore occasionner un doublon a la relance :
+il ne s'agit pas d'une transaction commune entre Google et le disque local.
+Le mode habituel, sans `--scheduled`, reste disponible pour un recalcul volontaire
+et ne consulte ni ne modifie cette memoire des exports.
+
+Tous les lancements du script prennent un verrou local commun, libere a la fin
+ou par le systeme si le processus est tue. Un lancement pendant un autre
+traitement est ignore avec un message dans le journal, sans ligne Executions.
+Ne pas supprimer le fichier `run.lock` pour debloquer un traitement actif.
+Ce verrou utilise `flock` sous Linux/WSL.
+`--scheduled` est incompatible avec `--file`, `--date` et `--flashscore`.
+
+Dans le Planificateur Windows, utiliser une seule tache :
+
+- Programme : `wsl.exe`.
+- Declencheur a l'ouverture de session Windows, avec repetition toutes les
+  **15 minutes**, pendant une duree **indefinie**.
+- Choisir « Executer uniquement si l'utilisateur est connecte ».
+- Dans les parametres, choisir « Ne pas demarrer une nouvelle instance » si
+  la tache est deja en cours ; eviter une limite de duree courte.
+- Desactiver les anciennes taches L1/PL a horaires fixes, pour eviter leurs
+  exports sans deduplication.
+
+Arguments :
+
+```text
+--user timotheeboulet --exec bash -lc "cd /home/timotheeboulet/vscode-repos/foulp/odds_parsing && .venv/bin/python master_odds_parser.py --scheduled -c l1 pl >> scheduled-run.log 2>&1"
+```
+
+Le PC doit etre allume et la session ouverte. Apres redemarrage et connexion,
+la repetition reprend automatiquement ; les matchs deja commences sont ignores.
+Sans `-c`, les trois competitions habituelles sont incluses.
+Apres un changement d'horaire, rafraichir les references avec
+`--scheduled --refresh-matches -c l1 pl`, puis retirer `--refresh-matches` des
+passages reguliers.
 
 ## Mode manuel
 
@@ -150,18 +214,58 @@ Il s'agit d'un bilan de fin de lancement, pas d'une notification ni d'un statut
 en temps reel. Un arret brutal ou une panne d'acces Google peut empecher son
 enregistrement ; consulter alors le journal local.
 
+Les bilans sont tries par debut d'execution, du plus recent au plus ancien
+(puis par fin d'execution en cas d'egalite). L'en-tete reste en premiere ligne.
+Aucune ligne de cet historique n'est supprimee.
+
+La colonne Detail liste les matchs exportes et associe chaque erreur au match
+concerne, avec le type et le message d'erreur. Sans noms d'equipes en mode manuel,
+les identifiants PMU et Winamax identifient la rencontre. Le detail est limite
+a 4000 caracteres dans Sheets ; les traces completes restent dans le journal.
+Une erreur de traitement sur un match n'annule pas les autres matchs du lot :
+tous sont executes, puis le lancement se termine avec le statut
+`Termine avec erreurs` si au moins un a echoue. Une erreur avant le lancement
+du lot (nettoyage, lecture de l'etat ou decouverte) empeche en revanche son analyse.
+
+### Nettoyage quotidien des onglets de matchs
+
+Avec `--scheduled`, le premier passage quotidien supprime les onglets des matchs
+des jours precedents, selon la date du coup d'envoi en Europe/Paris. Les matchs
+du jour restent disponibles jusqu'au lendemain : on ne deduit pas leur fin
+d'une duree de rencontre estimee.
+
+Par securite, seuls les **nouveaux onglets crees par le script**, exportes avec
+un horaire de rencontre connu, sont suivis. Les anciens onglets deja presents
+ne sont pas adoptes, meme lors d'un nouvel export dans ces onglets.
+Les onglets personnels, renommes et l'onglet Executions ne sont pas supprimes.
+Le suivi utilise l'identifiant du classeur et de l'onglet, pas seulement son nom.
+Un onglet suivi reutilise pour un autre match reste conserve jusqu'au lendemain
+du dernier coup d'envoi connu.
+
+Le registre local `.match-cache/sheets-cleanup.json` conserve les horaires,
+les onglets suivis et la date du dernier nettoyage reussi. Ne pas le supprimer
+si l'on veut conserver ce suivi. Une perte du registre laisse les onglets
+existants intacts. Une erreur Google ou un registre invalide est signale dans
+le bilan et fait echouer le passage ; un nettoyage incomplet est retente au
+prochain passage. Les anciens resultats ne sont pas archives avant suppression.
+Un nettoyage termine ne modifie pas la memoire des matchs deja exportes.
+
 ## Validation hors ligne
 
 Pour les combinaisons Winamax, le panier est vide avant chaque calcul. Chaque
 clic est confirme par le nombre et les noms exacts des lignes Joueur decisif
 dans l'unique item MyMatch (le compteur global peut afficher une seule selection
-pour un duo ou un trio). La cote finale doit etre stable sur trois lectures
+pour un duo ou un trio).
+Les espaces de mise en page autour et entre les mots des joueurs sont toleres,
+mais pas les noms differents ou les joueurs supplementaires.
+La cote finale doit etre stable sur trois lectures
 espacees de 0,5 seconde. Une incoherence declenche la reconstruction et une
 nouvelle tentative du combo ; un second echec arrete le match.
 
 ```bash
 python3 -m unittest -q test_match_discovery test_flashscore_lineups \
-  test_name_matching test_master_odds_parser test_betclic_odds test_executions
+  test_name_matching test_master_odds_parser test_betclic_odds test_executions \
+  test_scheduled_runs test_sheets_cleanup
 ```
 
 Certains tests utilisent Chromium localement sur des pages HTML de test.

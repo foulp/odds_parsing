@@ -145,6 +145,22 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual((records[0]["home"], records[0]["away"]), ("PSG", "Marseille"))
 
+    def test_betclic_skips_live_group_without_parsing_its_missing_kickoff(self):
+        page = MagicMock()
+        page.locator.return_value.evaluate_all.return_value = [
+            {"title": "Live - Match", "url": "https://betclic.fr/live-m111",
+             "date": "Maintenant", "time": ""},
+            {"title": "PSG - Marseille", "url": "https://betclic.fr/a-m123",
+             "date": "Jeu. 15/10", "time": "21:00"},
+        ]
+        with self.assertLogs(level="INFO") as logs:
+            records = discovery.read_betclic_matches(page, "l1", DAY)
+        self.assertEqual([r["url"] for r in records], ["https://betclic.fr/a-m123"])
+        self.assertIn("en direct ignoree", " ".join(logs.output))
+        page.locator.return_value.evaluate_all.return_value[1]["date"] = "Date inconnue"
+        with self.assertRaisesRegex(ValueError, "Date de groupe"):
+            discovery.read_betclic_matches(page, "l1", DAY)
+
 
 class CacheTests(unittest.TestCase):
     def test_refresh_only_rebuilds_selected_competitions(self):

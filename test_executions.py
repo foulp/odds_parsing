@@ -37,6 +37,39 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual((summary["exported"], summary["ignored"], summary["failed"]), (1, 1, 1))
         self.assertEqual(summary["status"], "Termine avec erreurs")
 
+    def test_failed_first_match_does_not_stop_queued_matches_and_details_name_each_outcome(self):
+        records = [
+            {"event_pmu": i, "event_wina": i, "url_betclic": "",
+             "home": f"Home {i}", "away": f"Away {i}"}
+            for i in range(1, 5)
+        ]
+
+        def worker(event, *args, **kwargs):
+            if event == 1:
+                raise ValueError("basket incomplete")
+            return "exported"
+
+        with patch.object(parser, "configure_logging"), \
+                patch.object(parser, "get_daily_matches", return_value=records), \
+                patch.object(parser, "process_single_match", side_effect=worker) as process, \
+                patch.object(parser, "export_execution") as export, \
+                self.assertLogs(level="ERROR"), self.assertRaises(SystemExit):
+            parser.main([])
+        self.assertEqual(process.call_count, 4)
+        summary = export.call_args.args[0]
+        self.assertEqual((summary["exported"], summary["failed"]), (3, 1))
+        self.assertIn("Erreur : Home 1 - Away 1 : ValueError: basket incomplete", summary["detail"])
+        for i in range(2, 5):
+            self.assertIn(f"Exporte : Home {i} - Away {i}", summary["detail"])
+
+    def test_manual_matches_without_team_names_use_bookmaker_ids(self):
+        records = [{"event_pmu": 123, "event_wina": 456, "url_betclic": ""}]
+        with patch.object(parser, "get_daily_matches", return_value=records), \
+                patch.object(parser, "process_single_match", return_value="exported"):
+            summary = dict(exported=0, ignored=0, failed=0, detail="")
+            parser.run_matches(parser.parse_args([]), summary)
+        self.assertEqual(summary["detail"], "Exporte : PMU 123 / Winamax 456\n")
+
     def test_sheet_failure_is_reported(self):
         with patch.object(parser, "configure_logging"), \
                 patch.object(parser, "get_daily_matches", return_value=[]), \
@@ -65,6 +98,9 @@ class ExecutionTests(unittest.TestCase):
         row = sheet.append_row.call_args.args[0]
         self.assertEqual(row[2:7], ["l1", "Termine", 2, 3, 0])
         self.assertEqual(sheet.append_row.call_args.kwargs["value_input_option"], "RAW")
+        sheet.sort.assert_called_once_with(
+            (1, "des"), (2, "des"), range="A2:H" + str(sheet.row_count),
+        )
 
     def test_incompatible_header_is_not_overwritten(self):
         with patch.object(parser.gspread, "service_account") as auth:
