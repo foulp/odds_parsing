@@ -91,6 +91,7 @@ class ExecutionTests(unittest.TestCase):
             book = auth.return_value.open.return_value
             book.worksheet.side_effect = parser.gspread.exceptions.WorksheetNotFound("missing")
             sheet = book.add_worksheet.return_value
+            sheet.col_count = 11
             sheet.row_values.return_value = []
             parser.export_execution(summary)
         self.assertEqual(book.add_worksheet.call_args.kwargs["title"], "Exécutions")
@@ -116,14 +117,38 @@ class ExecutionTests(unittest.TestCase):
         with patch.object(parser.gspread, "service_account") as auth:
             book = auth.return_value.open.return_value
             sheet = book.worksheet.return_value
+            sheet.col_count = 8
             sheet.row_values.return_value = [
                 "Debut (Paris)", "Fin (Paris)", "Competitions", "Statut",
                 "Matchs exportes", "Matchs ignores", "Matchs en erreur", "Detail",
             ]
             parser.export_execution(summary)
         book.add_worksheet.assert_not_called()
-        sheet.append_row.assert_called_once()
+        sheet.append_row.assert_not_called()
+        sheet.sort.assert_not_called()
+        sheet.resize.assert_called_once_with(cols=11)
+        self.assertEqual(sheet.update.call_args.kwargs["range_name"], "J2:K10")
+        values = sheet.update.call_args.kwargs["values"]
+        self.assertEqual(values[0], ["Dernier passage", ""])
+        self.assertEqual(values[4], ["Statut", "Aucun match exporte"])
         sheet.clear.assert_not_called()
+
+    def test_error_without_export_is_still_appended(self):
+        summary = dict(start="2026-10-15 18:30:00", competitions="pl",
+                       status="Termine avec erreurs", exported=0, ignored=0, failed=0,
+                       detail="ValueError: discovery")
+        with patch.object(parser.gspread, "service_account") as auth:
+            sheet = auth.return_value.open.return_value.worksheet.return_value
+            sheet.col_count = 11
+            sheet.row_values.return_value = [
+                "Debut (Paris)", "Fin (Paris)", "Competitions", "Statut",
+                "Matchs exportes", "Matchs ignores", "Matchs en erreur", "Detail",
+            ]
+            parser.export_execution(summary)
+        sheet.append_row.assert_called_once()
+        self.assertEqual(sheet.append_row.call_args.kwargs["table_range"], "A:H")
+        sheet.update.assert_called_once()
+        sheet.sort.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -73,19 +73,30 @@ def export_execution(summary):
     try:
         sheet = book.worksheet("Exécutions")
     except gspread.exceptions.WorksheetNotFound:
-        sheet = book.add_worksheet(title="Exécutions", rows="1000", cols=str(len(header)))
+        sheet = book.add_worksheet(title="Exécutions", rows="1000", cols="11")
     existing_header = sheet.row_values(1)
     if existing_header and existing_header != header:
         raise ValueError("Colonnes incompatibles dans l'onglet Executions")
     if not existing_header:
         sheet.append_row(header, value_input_option="RAW")
         sheet.freeze(rows=1)
-    sheet.append_row([
+    row = [
         summary["start"], datetime.now(PARIS).strftime("%Y-%m-%d %H:%M:%S"),
         summary["competitions"], summary["status"], summary["exported"],
         summary["ignored"], summary["failed"], summary["detail"][:4000],
-    ], value_input_option="RAW")
-    sheet.sort((1, "des"), (2, "des"), range="A2:H" + str(sheet.row_count))
+    ]
+    if sheet.col_count < 11:
+        sheet.resize(cols=11)
+    sheet.update(
+        range_name="J2:K10",
+        values=[["Dernier passage", ""], *[[label, value] for label, value in zip(header, row)]],
+        value_input_option="RAW",
+    )
+    if summary["exported"] or summary["failed"] or summary["status"] == "Termine avec erreurs":
+        sheet.append_row(row, value_input_option="RAW", table_range="A:H")
+        sheet.sort((1, "des"), (2, "des"), range="A2:H" + str(sheet.row_count))
+    else:
+        logging.info("[GSHEETS] Passage sans export ni erreur : dernier passage actualise uniquement.")
 
 # ==========================================
 # 1. MODULE GOOGLE SHEETS

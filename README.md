@@ -204,11 +204,16 @@ selectionnees ; pour une competition differente, fournir `flashscore_url`.
 
 ## Suivi des executions
 
-Chaque lancement ajoute une ligne dans l'onglet **Executions** (affiche
+Chaque lancement avec au moins un export ou une erreur ajoute une ligne dans l'onglet **Executions** (affiche
 **Exécutions** dans Sheets) du meme classeur : debut et fin en heure de Paris,
 competitions, statut, matchs exportes, ignores et en erreur, et detail d'erreur.
-L'onglet est cree automatiquement. Les lancements sans match eligible sont
-egalement enregistres. Une erreur de decouverte est indiquee dans le statut
+L'onglet est cree automatiquement. Les passages sans export ni erreur n'ajoutent
+pas de ligne d'historique ; ils restent dans le journal local.
+Un bloc **Dernier passage** en `J2:K10` est actualise a chaque fin d'execution,
+y compris sans activite, avec les horaires, le statut et les compteurs.
+Les colonnes J et K sont reservees a ce bloc, hors du tri de l'historique A:H.
+Les anciennes lignes sont conservees sans nettoyage retroactif.
+Une erreur de decouverte est indiquee dans le statut
 et le detail, sans etre comptee comme un match en erreur.
 Il s'agit d'un bilan de fin de lancement, pas d'une notification ni d'un statut
 en temps reel. Un arret brutal ou une panne d'acces Google peut empecher son
