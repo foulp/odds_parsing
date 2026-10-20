@@ -52,7 +52,7 @@ from flashscore_lineups import get_today_matches, get_match_lineups, filter_play
 from betclic_odds import extract_markets as extract_betclic_markets, build_results as build_betclic_results
 from name_matching import DEFAULT_MATCH_SCORE, match_names
 from match_discovery import COMPETITIONS, PARIS, get_daily_matches, select_matches, local_start
-from scheduled_runs import ExportedMatches, run_lock
+from scheduled_runs import ExportedMatches, SeenLineups, run_lock
 from sheets_cleanup import cleanup_match_sheets, track_match_sheet
 
 
@@ -92,7 +92,8 @@ def export_execution(summary):
         values=[["Dernier passage", ""], *[[label, value] for label, value in zip(header, row)]],
         value_input_option="RAW",
     )
-    if summary["exported"] or summary["failed"] or summary["status"] == "Termine avec erreurs":
+    if (summary["exported"] or summary["failed"] or summary.get("deferred")
+            or summary["status"] == "Termine avec erreurs"):
         sheet.append_row(row, value_input_option="RAW", table_range="A:H")
         sheet.sort((1, "des"), (2, "des"), range="A2:H" + str(sheet.row_count))
     else:
@@ -392,6 +393,30 @@ def timed_stage(match_label, stage):
         logging.info("[%s] Duree %s : %.2fs", match_label, stage, time.perf_counter() - started)
 
 
+LAST_CHANCE_MINUTES = 30
+
+
+class OddsNotReady(Exception):
+    """Les marches ne couvrent pas encore toutes les selections requises."""
+
+
+class LineupsJustReleased(OddsNotReady):
+    """Compositions officielles vues pour la premiere fois : cotes encore instables."""
+
+
+def require_odds(frame, quotes, column):
+    keys = ["Taille Combi", "Joueurs"]
+    checked = frame[keys].merge(
+        quotes[keys + [column]] if not quotes.empty else pd.DataFrame(columns=keys + [column]),
+        on=keys, how="left", validate="one_to_one",
+    )
+    odds = checked[column]
+    missing = checked.loc[~(np.isfinite(odds.astype(float)) & (odds > 1)), "Joueurs"]
+    if not missing.empty:
+        raise OddsNotReady(f"{column} : {len(missing)}/{len(frame)} selections indisponibles : "
+                           + ", ".join(missing))
+
+
 @contextmanager
 def wina_page(headless):
     with sync_playwright() as p:
@@ -546,7 +571,7 @@ def read_wina_combination(page, tableaux, names):
 # ==========================================
 # 4. MODULE MASTER (WINA + CRÉATION PMU COMBOS)
 # ==========================================
-def run_master_wina_and_pmu(url_match, event_id_pmu, df_pmu_simples, tailles_combi, cote_out, ratio_min, name_match_score=DEFAULT_MATCH_SCORE, headless=True, pmu_session=None):
+def run_master_wina_and_pmu(url_match, event_id_pmu, df_pmu_simples, tailles_combi, cote_out, ratio_min, name_match_score=DEFAULT_MATCH_SCORE, headless=True, pmu_session=None, require_complete=False):
     """
     Extrait les simples Wina puis filtre par cote PMU < cote_out OU ratio >= ratio_min.
     Genere les combinaisons a la demande sans changer l'ordre ni la couverture PMU.
@@ -565,6 +590,8 @@ def run_master_wina_and_pmu(url_match, event_id_pmu, df_pmu_simples, tailles_com
         try:
             page.get_by_text("Joueur décisif", exact=True).first.wait_for(timeout=10000)
         except PlaywrightTimeoutError:
+            if require_complete:
+                raise OddsNotReady("Marche Joueur decisif indisponible sur Winamax")
             logging.warning("[%s] Marche Joueur decisif indisponible sur Winamax", nom_match_log)
             return df_pmu_simples.drop(columns=['outcome_id']), pd.DataFrame()
 
@@ -575,6 +602,8 @@ def run_master_wina_and_pmu(url_match, event_id_pmu, df_pmu_simples, tailles_com
             mapping_pmu_to_wina, ratio_dict, df_wina_results = match_wina_players(
                 df_pmu_simples, wina_simples_bruts, name_match_score,
             )
+            if require_complete:
+                require_odds(df_pmu_simples, pd.DataFrame(df_wina_results), "Cote Wina")
 
         valid_combos = iter_pmu_combinations(
             df_pmu_simples, ratio_dict, tailles_combi, cote_out, ratio_min,
@@ -638,7 +667,13 @@ def run_master_wina_and_pmu(url_match, event_id_pmu, df_pmu_simples, tailles_com
                             raise RuntimeError(
                                 f"Winamax reste indisponible pour {cle_universelle_pmu}; arret du match"
                             ) from exc
-                        tableaux, _ = recover_wina_market(page, joueurs_wina_list)
+                        try:
+                            tableaux, _ = recover_wina_market(page, joueurs_wina_list)
+                        except (PlaywrightError, AssertionError, ValueError) as recovery_error:
+                            raise RuntimeError(
+                                f"Recuperation Winamax impossible pour {cle_universelle_pmu} ; "
+                                "arret du match sans export"
+                            ) from recovery_error
 
         logging.info("[%s] Duree combinaisons Wina : %.2fs",
                      nom_match_log, time.perf_counter() - wina_started)
@@ -663,7 +698,8 @@ def run_betclic_extraction(url_match, df_pmu, headless=True, name_match_score=DE
 # ==========================================
 
 def process_single_match(event_pmu, event_wina, url_betclic, args, gsheet_credentials, delay,
-                         flashscore_matches=None, flashscore_url=None, match_start=None):
+                         flashscore_matches=None, flashscore_url=None, match_start=None,
+                         lineups_seen=True):
     """Encapsule la logique d'un match avec un délai de démarrage anti-bot."""
     # Désynchronisation initiale pour éviter les pics de requêtes
     time.sleep(delay)
@@ -671,6 +707,8 @@ def process_single_match(event_pmu, event_wina, url_betclic, args, gsheet_creden
     
     try:
         official_only = args.official_lineups_only
+        scheduled = getattr(args, "scheduled", False)
+        has_betclic = pd.notna(url_betclic) and bool(str(url_betclic).strip())
         if official_only:
             if not flashscore_url or match_start is None:
                 raise ValueError("--official-lineups-only exige flashscore_url et start pour chaque match")
@@ -719,16 +757,30 @@ def process_single_match(event_pmu, event_wina, url_betclic, args, gsheet_creden
                 logging.info("[%s] Match ignore : coup d'envoi atteint pendant la verification.",
                              match_label)
                 return "ignored"
+            require_complete = scheduled and local_start(match_start) > (
+                datetime.now(PARIS) + timedelta(minutes=LAST_CHANCE_MINUTES)
+            )
+            if require_complete and not lineups_seen:
+                raise LineupsJustReleased(
+                    "compositions officielles tout juste publiees ; attente d'un passage "
+                    "pour laisser les cotes se stabiliser"
+                )
+            if require_complete:
+                require_odds(df_pmu_simples, df_pmu_simples, "Cote PMU")
+            elif scheduled:
+                logging.info("[%s] Dernier passage avant le coup d'envoi : export meme si des cotes "
+                             "simples PMU/Winamax manquent.", match_label)
             with timed_stage(match_label, "pipeline Wina et combinaisons"):
                 df_pmu_final, df_wina = run_master_wina_and_pmu(
                     url_wina_full, event_pmu, df_pmu_simples, args.tailles,
                     args.cote_out, args.ratio_min, args.name_match_score, args.headless,
                     pmu_session=session,
+                    **({"require_complete": True} if require_complete else {}),
                 )
         
         df_final = pd.merge(df_pmu_final, df_wina, on=['Taille Combi', 'Joueurs'], how='left') if not df_wina.empty else df_pmu_final.assign(**{'Cote Wina': np.nan})
             
-        if pd.notna(url_betclic) and str(url_betclic).strip():
+        if has_betclic:
             with timed_stage(match_label, "extraction Betclic"):
                 df_bc = run_betclic_extraction(str(url_betclic).strip(), df_final, args.headless,
                                               args.name_match_score)
@@ -753,6 +805,10 @@ def process_single_match(event_pmu, event_wina, url_betclic, args, gsheet_creden
         logging.info("[%s] Termine avec succes.", match_label)
         return "exported"
         
+    except OddsNotReady as exc:
+        logging.info("[%s] Match differe : %s ; nouvel essai au prochain passage avant le coup d'envoi.",
+                     match_label, exc)
+        raise
     except Exception:
         logging.exception("[%s] ERREUR GLOBALE", match_label)
         raise
@@ -843,6 +899,7 @@ def load_manual_matches(args):
 
 def run_matches(args, summary):
     exported_matches = ExportedMatches() if args.scheduled else None
+    seen_lineups = SeenLineups() if args.scheduled else None
     discovery_issues = []
     if args.file:
         matches = load_manual_matches(args)
@@ -909,6 +966,8 @@ def run_matches(args, summary):
                 row["event_pmu"], row["event_wina"], row["url_betclic"],
                 args, GSHEET_CREDENTIALS, jitter, flashscore_matches, row.get("flashscore_url") or None,
                 **({"match_start": row["start"]} if row.get("start") else {}),
+                **({"lineups_seen": seen_lineups.contains(row["event_pmu"])}
+                   if seen_lineups is not None else {}),
             )
             futures[future] = row
             
@@ -918,10 +977,20 @@ def run_matches(args, summary):
             match_label = (f"{row['home']} - {row['away']}"
                            if row.get("home") and row.get("away")
                            else f"PMU {row['event_pmu']} / Winamax {row['event_wina']}")
-            if future.exception() is not None:
+            error = future.exception()
+            if isinstance(error, LineupsJustReleased):
+                try:
+                    seen_lineups.mark_seen(row["event_pmu"], datetime.now(PARIS))
+                except OSError as exc:
+                    logging.warning("[PLANIFICATION] %s : compositions vues mais non memorisees : %s",
+                                    match_label, exc)
+            if isinstance(error, OddsNotReady):
+                summary["ignored"] += 1
+                summary["deferred"] = summary.get("deferred", 0) + 1
+                summary["detail"] += f"Differe : {match_label} : {error}\n"
+            elif error is not None:
                 failed = True
                 summary["failed"] += 1
-                error = future.exception()
                 logging.error("[%s] Echec du traitement : %s", match_label, error)
                 summary["detail"] += f"Erreur : {match_label} : {type(error).__name__}: {error}\n"
             else:
@@ -955,7 +1024,7 @@ def execute_run(args):
     summary = {
         "start": datetime.now(PARIS).strftime("%Y-%m-%d %H:%M:%S"),
         "competitions": ", ".join(args.competition or (["CSV manuel"] if args.file else COMPETITIONS)),
-        "status": "Termine", "exported": 0, "ignored": 0, "failed": 0, "detail": "",
+        "status": "Termine", "exported": 0, "ignored": 0, "failed": 0, "deferred": 0, "detail": "",
     }
     try:
         if args.scheduled:

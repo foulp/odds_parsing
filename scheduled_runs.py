@@ -1,6 +1,7 @@
-"""Persistent successful exports and a cross-process lock for local WSL runs."""
+"""Persistent scheduled-run state (exports, lineup sightings) and a cross-process lock."""
 
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 import fcntl
 import json
 import logging
@@ -49,3 +50,38 @@ class ExportedMatches:
                              encoding="utf-8")
         temporary.replace(self.path)
         self.exported = updated
+
+
+class SeenLineups:
+    """Premier passage ou les compositions officielles d'un match ont ete vues."""
+
+    RETENTION = timedelta(days=2)
+
+    def __init__(self):
+        self.path = CACHE_DIR / "lineups-seen.json"
+        self.seen = {}
+        if self.path.exists():
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            if (not isinstance(payload, dict) or payload.get("version") != 1
+                    or not isinstance(payload.get("seen"), dict)):
+                raise ValueError(f"Etat des compositions invalide : {self.path}")
+            try:
+                self.seen = {int(event): datetime.fromisoformat(moment)
+                             for event, moment in payload["seen"].items()}
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Etat des compositions invalide : {self.path}") from exc
+
+    def contains(self, event_pmu):
+        return event_pmu in self.seen
+
+    def mark_seen(self, event_pmu, moment):
+        updated = {event: seen for event, seen in self.seen.items()
+                   if seen >= moment - self.RETENTION}
+        updated.setdefault(event_pmu, moment)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"version": 1, "seen": {
+            str(event): seen.isoformat() for event, seen in sorted(updated.items())
+        }}), encoding="utf-8")
+        temporary.replace(self.path)
+        self.seen = updated

@@ -102,6 +102,22 @@ reconnus par equipe. Une equipe sans aucun titulaire reconnu reste une erreur.
 La composition officielle doit toujours etre complete sur Flashscore :
 ce traitement partiel concerne uniquement son rapprochement avec le marche PMU.
 
+### Rapprochement des noms PMU / Winamax / Betclic
+
+Les noms sont compares sans accents, ponctuation ni casse ; une date de naissance
+entre parentheses ajoutee par Betclic pour distinguer des homonymes
+(`C. Eduardo (10/08/2002)`) est ignoree. Deux homonymes restent alors ambigus
+et ne sont pas rapproches. Quand les sites retiennent des prenoms differents
+pour un meme joueur, ajouter une ligne `nom PMU;nom bookmaker` dans
+[aliases.csv](./aliases.csv) (lignes `#` ignorees) :
+
+```
+Caumenan N'Guessan;Ange N'Guessan
+```
+
+Un alias prime sur le seuil `--name-match-score` et vaut pour Winamax et Betclic.
+Les candidats `NON RECONNU` du journal indiquent les noms a ajouter.
+
 ### Taches planifiees : uniquement les compositions officielles
 
 ```bash
@@ -155,6 +171,33 @@ suivants, meme apres redemarrage du PC. Les absences de composition et les erreu
 ne sont pas memorisees comme des succes : elles sont retentees au prochain
 passage, tant que le match n'a pas commence. Les cotes et compositions ne sont
 pas mises en cache. Un etat d'exports invalide provoque une erreur explicite.
+
+En mode `--scheduled`, un match dont les cotes simples sont incompletes est
+**differe**, sans ecriture dans Sheets ni memorisation comme succes : toutes les
+cotes simples PMU et Winamax des joueurs retenus sont exigees (cote finie et
+strictement superieure a 1 ; un joueur absent ou non rapproche compte comme
+manquant). Le controle PMU precede l'ouverture de Winamax et le controle Winamax
+precede les calculs de combinaisons. Les cotes Betclic, les combinaisons et le
+nombre de titulaires reconnus ne bloquent jamais l'export.
+
+Les cotes bougent fortement juste apres la publication des compositions : le
+premier passage qui voit les compositions officielles d'un match ne l'exporte pas.
+Il memorise ce moment dans `.match-cache/lineups-seen.json` (entrees de plus de
+2 jours purgees) et l'export a lieu au passage suivant, 15 minutes plus tard.
+
+A 30 minutes ou moins du coup d'envoi (`LAST_CHANCE_MINUTES`), c'est le dernier
+essai : le match est exporte sans attente apres les compositions et meme si des
+cotes simples manquent, pour ne pas le perdre a cause d'un nom non rapproche ou
+d'un joueur jamais propose.
+Un passage contenant un match differe ajoute une ligne a l'historique Executions,
+avec la raison dans le detail (`Differe : ...`) ; le match
+est compte parmi les ignores. Sans `--scheduled`, les exports partiels habituels
+restent autorises.
+
+Si la lecture MyMatch echoue, le marche Winamax est recharge et la meme
+combinaison retentee une fois. Une recuperation impossible arrete le match sans
+exporter les calculs partiels ; le journal conserve la combinaison et la cause.
+En mode planifie, le match reste eligible au prochain passage avant le coup d'envoi.
 
 Le succes est enregistre apres le retour de l'export Sheets. Un arret brutal
 entre l'ecriture Sheets et la sauvegarde locale, ou un export partiellement
@@ -219,10 +262,10 @@ selectionnees ; pour une competition differente, fournir `flashscore_url`.
 
 ## Suivi des executions
 
-Chaque lancement avec au moins un export ou une erreur ajoute une ligne dans l'onglet **Executions** (affiche
+Chaque lancement avec au moins un export, un match differe ou une erreur ajoute une ligne dans l'onglet **Executions** (affiche
 **Exécutions** dans Sheets) du meme classeur : debut et fin en heure de Paris,
 competitions, statut, matchs exportes, ignores et en erreur, et detail d'erreur.
-L'onglet est cree automatiquement. Les passages sans export ni erreur n'ajoutent
+L'onglet est cree automatiquement. Les passages sans export, report ni erreur n'ajoutent
 pas de ligne d'historique ; ils restent dans le journal local.
 Un bloc **Dernier passage** en `J2:K10` est actualise a chaque fin d'execution,
 y compris sans activite, avec les horaires, le statut et les compteurs.

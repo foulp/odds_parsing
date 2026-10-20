@@ -80,6 +80,47 @@ class ScheduledRunTests(unittest.TestCase):
         process.assert_called_once()
         self.assertEqual(counts["exported"], 1)
 
+    def test_incomplete_odds_are_reported_and_retried_without_marking_exported(self):
+        counts, _ = self.run_matches([match(1, 45)], [parser.OddsNotReady("Cote Wina : 1/20")])
+        self.assertEqual((counts["ignored"], counts["failed"], counts["exported"]), (1, 0, 0))
+        self.assertIn("Differe : PMU 1 / Winamax 1 : Cote Wina : 1/20", counts["detail"])
+        self.assertEqual(counts["deferred"], 1)
+        self.assertFalse(scheduled_runs.ExportedMatches().contains(1))
+        counts, process = self.run_matches([match(1, 15)], ["exported"])
+        process.assert_called_once()
+        self.assertEqual(counts["exported"], 1)
+        self.assertTrue(scheduled_runs.ExportedMatches().contains(1))
+
+    def test_first_lineup_sighting_waits_for_next_run(self):
+        released = parser.LineupsJustReleased("compositions officielles tout juste publiees")
+        counts, process = self.run_matches([match(1, 60)], [released])
+        self.assertFalse(process.call_args.kwargs["lineups_seen"])
+        self.assertEqual((counts["deferred"], counts["failed"], counts["exported"]), (1, 0, 0))
+        self.assertIn("Differe : PMU 1 / Winamax 1 : compositions", counts["detail"])
+        self.assertTrue(scheduled_runs.SeenLineups().contains(1))
+        counts, process = self.run_matches([match(1, 45)], ["exported"])
+        self.assertTrue(process.call_args.kwargs["lineups_seen"])
+        self.assertEqual(counts["exported"], 1)
+
+    def test_other_deferrals_do_not_mark_lineups_as_seen(self):
+        self.run_matches([match(1, 60)], [parser.OddsNotReady("Cote Wina : 1/20")])
+        self.assertFalse(scheduled_runs.SeenLineups().contains(1))
+
+    def test_old_lineup_sightings_are_pruned(self):
+        seen = scheduled_runs.SeenLineups()
+        seen.mark_seen(1, NOW - timedelta(days=3))
+        seen.mark_seen(2, NOW)
+        reloaded = scheduled_runs.SeenLineups()
+        self.assertFalse(reloaded.contains(1))
+        self.assertTrue(reloaded.contains(2))
+        seen.mark_seen(2, NOW + timedelta(hours=1))
+        self.assertEqual(scheduled_runs.SeenLineups().seen[2], NOW)
+
+    def test_invalid_lineup_state_is_rejected(self):
+        (self.cache / "lineups-seen.json").write_text('{"version": 1, "seen": {"x": "y"}}')
+        with self.assertRaisesRegex(ValueError, "compositions invalide"):
+            scheduled_runs.SeenLineups()
+
     def test_failure_remains_retryable_but_other_success_is_saved(self):
         counts = summary()
 

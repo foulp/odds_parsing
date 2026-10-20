@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta
 from itertools import combinations
 import argparse
 from types import SimpleNamespace
@@ -139,6 +140,123 @@ class MatchingTests(unittest.TestCase):
                     players_frame(), [{"home": 1, "Nom": "Alice", "Cote": odds}], 100,
                 )
                 self.assertEqual(result, ({}, {}, []))
+
+
+class OddsReadinessTests(unittest.TestCase):
+    def test_requires_every_selection_with_a_finite_price_above_one(self):
+        frame = players_frame().drop(columns="outcome_id")
+        parser.require_odds(frame, frame, "Cote PMU")
+        for value in (None, float("nan"), float("inf"), 0, 1, -1):
+            with self.subTest(value=value):
+                quotes = frame.copy()
+                quotes.loc["a", "Cote PMU"] = value
+                with self.assertRaisesRegex(parser.OddsNotReady, "Alice"):
+                    parser.require_odds(frame, quotes, "Cote PMU")
+        for quotes in (pd.DataFrame(), frame.iloc[1:]):
+            with self.assertRaisesRegex(parser.OddsNotReady, "Alice"):
+                parser.require_odds(frame, quotes, "Cote PMU")
+
+    def test_wina_missing_single_defers_before_combination_requests(self):
+        with patch.object(parser, "wina_page"), \
+                patch.object(parser, "prepare_wina_market"), \
+                patch.object(parser, "extract_wina_players", return_value=({}, [])), \
+                patch.object(parser, "get_pmu_combi_odds") as quote, \
+                self.assertRaises(parser.OddsNotReady):
+            parser.run_master_wina_and_pmu(
+                "url", 123, players_frame(), [2], 4, 1.15, require_complete=True,
+            )
+        quote.assert_not_called()
+
+    def test_failed_recovery_keeps_combination_context_and_original_error(self):
+        frame = players_frame().iloc[:2]
+        wina = [{"Nom": p["Joueurs"], "home": 1, "Cote": 2.0}
+                for p in frame.to_dict("records")]
+        failure = parser.PlaywrightTimeoutError("Joueur decisif absent")
+        with patch.object(parser, "wina_page"), \
+                patch.object(parser, "prepare_wina_market"), \
+                patch.object(parser, "extract_wina_players", return_value=({}, wina)), \
+                patch.object(parser, "get_pmu_combi_odds", return_value=6.5), \
+                patch.object(parser, "read_wina_combination",
+                             side_effect=parser.PlaywrightTimeoutError("basket")), \
+                patch.object(parser, "recover_wina_market", side_effect=failure), \
+                patch.object(parser.time, "sleep"), self.assertLogs(level="WARNING"), \
+                self.assertRaisesRegex(RuntimeError, "Alice - Bob.*sans export") as error:
+            parser.run_master_wina_and_pmu("url", 123, frame, [2], 4, 1.15)
+        self.assertIs(error.exception.__cause__, failure)
+
+    def run_scheduled_match(self, missing=None, minutes_before=24 * 60, lineups_seen=True):
+        singles = pd.DataFrame([
+            dict(players_frame().iloc[0], home=home, Joueurs=f"Player {home} {i}",
+                 outcome_id=str(home * 10 + i))
+            for home in (1, 0) for i in range(10)
+        ])
+        final = singles.drop(columns="outcome_id")
+        for size in (2, 3):
+            final.loc[len(final)] = dict(final.iloc[0], **{
+                "Taille Combi": size, "Joueurs": f"Combo {size}",
+            })
+        wina = final[["Taille Combi", "Joueurs"]].assign(**{"Cote Wina": 2.0})
+        quotes = final[final["Taille Combi"] <= 2][["Taille Combi", "Joueurs"]].assign(
+            **{"Cote Betclic": 2.0},
+        )
+        if missing == "lineup":
+            singles = singles.iloc[1:]
+        elif missing == "pmu_single":
+            singles.loc[0, "Cote PMU"] = None
+        elif missing == "betclic_single":
+            quotes = quotes.iloc[1:]
+        elif missing == "betclic_duo":
+            quotes = quotes[quotes["Taille Combi"] == 1]
+        elif missing == "wina_combo":
+            wina = wina[wina["Taille Combi"] == 1]
+        start = datetime.now(parser.PARIS) + timedelta(minutes=minutes_before)
+        args = parser.parse_args(["--scheduled"])
+        with patch.object(parser, "get_pmu_players_dict", return_value=singles), \
+                patch.object(parser, "get_match_lineups", return_value={}), \
+                patch.object(parser, "filter_players", side_effect=lambda frame, _: frame), \
+                patch.object(parser, "run_betclic_extraction", return_value=quotes), \
+                patch.object(parser, "run_master_wina_and_pmu",
+                             return_value=(final, wina)) as pipeline, \
+                patch.object(parser, "export_to_google_sheets") as export, \
+                patch.object(parser.time, "sleep"):
+            self.pipeline = pipeline
+            result = parser.process_single_match(
+                123, 456, "https://betclic.test", args, "key.json", 0,
+                flashscore_url="https://fixture.test", match_start=start.isoformat(),
+                lineups_seen=lineups_seen,
+            )
+        return result, pipeline, export
+
+    def test_missing_pmu_single_defers_before_pipeline(self):
+        with self.assertRaisesRegex(parser.OddsNotReady, "Player 1 0"), \
+                self.assertLogs(level="INFO"):
+            self.run_scheduled_match("pmu_single")
+
+    def test_only_pmu_and_wina_singles_are_required(self):
+        for missing in (None, "lineup", "betclic_single", "betclic_duo", "wina_combo"):
+            with self.subTest(missing=missing):
+                result, pipeline, export = self.run_scheduled_match(missing)
+                self.assertEqual(result, "exported")
+                self.assertTrue(pipeline.call_args.kwargs["require_complete"])
+                export.assert_called_once()
+
+    def test_first_lineup_sighting_defers_before_pipeline(self):
+        with self.assertRaises(parser.LineupsJustReleased), self.assertLogs(level="INFO"):
+            self.run_scheduled_match(lineups_seen=False)
+        self.pipeline.assert_not_called()
+
+    def test_last_chance_does_not_wait_after_first_lineup_sighting(self):
+        result, _, export = self.run_scheduled_match(minutes_before=20, lineups_seen=False)
+        self.assertEqual(result, "exported")
+        export.assert_called_once()
+
+    def test_last_chance_exports_incomplete_singles(self):
+        for minutes in (30, 10):
+            with self.subTest(minutes=minutes):
+                result, pipeline, export = self.run_scheduled_match("pmu_single", minutes)
+                self.assertEqual(result, "exported")
+                self.assertNotIn("require_complete", pipeline.call_args.kwargs)
+                export.assert_called_once()
 
 
 class PmuTests(unittest.TestCase):

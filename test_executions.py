@@ -133,6 +133,21 @@ class ExecutionTests(unittest.TestCase):
             (1, "des"), (2, "des"), range="A2:H" + str(sheet.row_count),
         )
 
+    def test_deferred_only_run_is_kept_in_history(self):
+        summary = dict(start="2026-10-20 18:05:00", competitions="ldc", status="Termine",
+                       exported=0, ignored=1, failed=0, deferred=1,
+                       detail="Differe (cotes incompletes) : A - B : Cote Wina : 1/20\n")
+        with patch.object(parser.gspread, "service_account") as auth:
+            sheet = auth.return_value.open.return_value.worksheet.return_value
+            sheet.col_count = 11
+            sheet.row_values.return_value = [
+                "Debut (Paris)", "Fin (Paris)", "Competitions", "Statut",
+                "Matchs exportes", "Matchs ignores", "Matchs en erreur", "Detail",
+            ]
+            parser.export_execution(summary)
+        sheet.append_row.assert_called_once()
+        self.assertIn("Differe", sheet.append_row.call_args.args[0][7])
+
     def test_incompatible_header_is_not_overwritten(self):
         with patch.object(parser.gspread, "service_account") as auth:
             sheet = auth.return_value.open.return_value.worksheet.return_value

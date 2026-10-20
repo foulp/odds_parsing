@@ -1,6 +1,7 @@
 """Matching commun : exact, abreviation/nom court unique, puis fuzzy global."""
 
 import logging
+from pathlib import Path
 import re
 
 from thefuzz import fuzz
@@ -8,10 +9,14 @@ from unidecode import unidecode
 
 
 DEFAULT_MATCH_SCORE = 80
+ALIASES_PATH = Path(__file__).resolve().parent / "aliases.csv"
+BIRTH_DATE = re.compile(r"\(\s*\d{1,2}/\d{1,2}/\d{2,4}\s*\)")
 
 
 def normalize_name(value):
-    return " ".join(re.findall(r"[a-z0-9]+", unidecode(str(value)).lower()))
+    """Minuscules sans accents ni ponctuation ; ignore une date de naissance entre parentheses."""
+    value = BIRTH_DATE.sub(" ", str(value))
+    return " ".join(re.findall(r"[a-z0-9]+", unidecode(value).lower()))
 
 
 def name_score(left, right):
@@ -51,7 +56,24 @@ def matches_abbreviation(label, full_name):
     )
 
 
-def match_names(reference_names, candidate_names, min_score=DEFAULT_MATCH_SCORE, label="NOMS"):
+def load_aliases(path=None):
+    """Lit `aliases.csv` : `nom PMU;nom bookmaker` par ligne, `#` pour commenter."""
+    path = Path(path) if path is not None else ALIASES_PATH
+    aliases = {}
+    if not path.exists():
+        return aliases
+    for number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        fields = [normalize_name(field) for field in line.split(";")]
+        if len(fields) != 2 or not all(fields):
+            raise ValueError(f"Alias invalide ligne {number} de {path} : {line!r}")
+        aliases.setdefault(fields[0], set()).add(fields[1])
+    return aliases
+
+
+def match_names(reference_names, candidate_names, min_score=DEFAULT_MATCH_SCORE, label="NOMS",
+                aliases=None):
     """Retourne index reference -> (index candidat, score), sans reutilisation.
 
     Les noms exacts puis les abreviations passent avant le fuzzy global.
@@ -62,6 +84,7 @@ def match_names(reference_names, candidate_names, min_score=DEFAULT_MATCH_SCORE,
     Les candidats attribues sont exclus.
     Un ecart inferieur a cinq points entre les deux meilleurs candidats restants
     est refuse, meme au-dessus du seuil. Les references sont les noms PMU.
+    Les alias de `aliases.csv` (nom PMU ; nom bookmaker) passent en premier.
     """
     references = [normalize_name(name) for name in reference_names]
     candidates = [normalize_name(name) for name in candidate_names]
@@ -102,6 +125,8 @@ def match_names(reference_names, candidate_names, min_score=DEFAULT_MATCH_SCORE,
     def comparison(i, j):
         if references[i] and references[i] == candidates[j]:
             return 0, 100, "EXACT"
+        if candidates[j] in aliases.get(references[i], ()):
+            return 0, 100, "ALIAS"
         if matches_abbreviation(reference_names[i], candidate_names[j]) or matches_abbreviation(
             candidate_names[j], reference_names[i],
         ):
@@ -111,6 +136,8 @@ def match_names(reference_names, candidate_names, min_score=DEFAULT_MATCH_SCORE,
         if unique_middle_omission(references[i], candidates[j]):
             return 1, 100, "NOMS_INTERMEDIAIRES_OMIS"
         return 2, name_score(references[i], candidates[j]), "FUZZY_GLOBAL"
+
+    aliases = load_aliases() if aliases is None else aliases
 
     comparisons = {
         (i, j): comparison(i, j)

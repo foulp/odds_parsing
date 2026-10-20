@@ -1,6 +1,10 @@
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 
-from name_matching import match_names, name_score, normalize_name, matches_abbreviation
+from name_matching import (
+    load_aliases, match_names, name_score, normalize_name, matches_abbreviation,
+)
 
 
 class NameMatchingTests(unittest.TestCase):
@@ -151,6 +155,44 @@ class NameMatchingTests(unittest.TestCase):
     def test_abbreviation_ambiguity_is_rejected(self):
         with self.assertLogs(level="WARNING"):
             self.assertEqual(match_names(["A. Gouiri"], ["Amine Gouiri", "Adam Gouiri"]), {})
+
+    def test_birth_date_suffix_is_ignored(self):
+        self.assertEqual(normalize_name("Nico González (03/01/2002)"), "nico gonzalez")
+        self.assertTrue(matches_abbreviation("C. Eduardo (10/08/2002)", "Carlos Eduardo (10/02/2002)"))
+        with self.assertLogs(level="INFO"):
+            self.assertEqual(match_names(["Nico Gonzalez"], ["Nico González (03/01/2002)"]),
+                             {0: (0, 100)})
+
+    def test_homonyms_without_date_stay_ambiguous(self):
+        with self.assertLogs(level="WARNING"):
+            self.assertEqual(match_names(
+                ["Carlos Eduardo"], ["Carlos Eduardo (10/02/2002)", "Carlos Eduardo (01/01/1999)"],
+            ), {})
+
+    def test_alias_file_links_different_first_names(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "aliases.csv"
+            path.write_text("# PMU;bookmaker\n\nCaumenan N'Guessan;Ange N'Guessan\n",
+                            encoding="utf-8")
+            aliases = load_aliases(path)
+        with self.assertLogs(level="INFO") as logs:
+            matches = match_names(["Caumenan N'Guessan", "David Zima"],
+                                  ["Ange N'Guessan", "David Zima"], 100, aliases=aliases)
+        self.assertEqual(matches, {0: (0, 100), 1: (1, 100)})
+        self.assertIn("methode=ALIAS", "\n".join(logs.output))
+
+    def test_without_alias_different_first_names_stay_unmatched(self):
+        with self.assertLogs(level="INFO"):
+            self.assertEqual(match_names(["Caumenan N'Guessan"], ["Ange N'Guessan"], aliases={}), {})
+
+    def test_missing_or_invalid_alias_file(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "aliases.csv"
+            self.assertEqual(load_aliases(path), {})
+            path.write_text("Only one name\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "ligne 1"):
+                load_aliases(path)
+
 
 
 if __name__ == "__main__":
