@@ -5,6 +5,36 @@ import master_odds_parser as parser
 
 
 class ExecutionTests(unittest.TestCase):
+    def test_discovery_issues_do_not_prevent_exporting_resolved_matches(self):
+        def discover(*args, **kwargs):
+            kwargs["issues"].append("[LDC] Fenerbahce - Slavia Prague : BETCLIC introuvable")
+            return [{"event_pmu": 1, "event_wina": 2, "url_betclic": "",
+                     "home": "Available", "away": "Match"}]
+
+        with patch.object(parser, "configure_logging"), \
+                patch.object(parser, "get_daily_matches", side_effect=discover), \
+                patch.object(parser, "process_single_match", return_value="exported") as process, \
+                patch.object(parser, "export_execution") as export, self.assertRaises(SystemExit):
+            parser.main([])
+        process.assert_called_once()
+        summary = export.call_args.args[0]
+        self.assertEqual((summary["failed"], summary["exported"]), (1, 1))
+        self.assertEqual(summary["status"], "Termine avec erreurs")
+        self.assertIn("Exporte : Available - Match", summary["detail"])
+        self.assertIn("Erreur decouverte : [LDC]", summary["detail"])
+
+    def test_discovery_issues_are_reported_even_without_eligible_matches(self):
+        def discover(*args, **kwargs):
+            kwargs["issues"].append("BETCLIC missing")
+            return []
+
+        with patch.object(parser, "configure_logging"), \
+                patch.object(parser, "get_daily_matches", side_effect=discover), \
+                patch.object(parser, "export_execution") as export, self.assertRaises(SystemExit):
+            parser.main([])
+        self.assertEqual(export.call_args.args[0]["failed"], 1)
+        self.assertIn("BETCLIC missing", export.call_args.args[0]["detail"])
+
     def test_empty_run_is_recorded(self):
         with patch.object(parser, "configure_logging"), \
                 patch.object(parser, "get_daily_matches", return_value=[]), \

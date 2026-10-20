@@ -843,6 +843,7 @@ def load_manual_matches(args):
 
 def run_matches(args, summary):
     exported_matches = ExportedMatches() if args.scheduled else None
+    discovery_issues = []
     if args.file:
         matches = load_manual_matches(args)
         need_calendar = args.flashscore and any(not r.get("flashscore_url") for r in matches)
@@ -854,10 +855,16 @@ def run_matches(args, summary):
             matches = get_daily_matches(
                 list(dict.fromkeys(args.competition or COMPETITIONS)), session, args.headless,
                 queries=args.match, refresh=args.refresh_matches, today=args.date,
+                issues=discovery_issues,
             )
         flashscore_matches = None
+    if discovery_issues:
+        summary["failed"] += len(discovery_issues)
+        summary["detail"] += "".join(f"Erreur decouverte : {issue}\n" for issue in discovery_issues)
     if not matches:
         logging.info("Aucun match a analyser dans le perimetre selectionne.")
+        if discovery_issues:
+            raise SystemExit(1)
         return
     if args.official_lineups_only:
         now = datetime.now(PARIS)
@@ -881,6 +888,8 @@ def run_matches(args, summary):
         matches = upcoming
         if not matches:
             logging.info("Aucun match a venir a analyser.")
+            if discovery_issues:
+                raise SystemExit(1)
             return
         
     GSHEET_CREDENTIALS = "credentials.json"
@@ -903,7 +912,7 @@ def run_matches(args, summary):
             )
             futures[future] = row
             
-        failed = False
+        failed = bool(discovery_issues)
         for future in as_completed(futures):
             row = futures[future]
             match_label = (f"{row['home']} - {row['away']}"

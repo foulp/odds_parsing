@@ -68,13 +68,64 @@ class MatchingTests(unittest.TestCase):
             result = flashscore.filter_players(frame, lineups)
         self.assertEqual(result["Joueurs"].tolist(), ["Alice Smith", "Bob Smith"])
 
-    def test_ambiguous_name_is_rejected(self):
+    def test_ambiguous_name_is_excluded_and_logs_all_candidates(self):
         frame = pd.DataFrame([
             {"home": 1, "Joueurs": "John Smith"},
             {"home": 1, "Joueurs": "James Smith"},
+            {"home": 1, "Joueurs": "Alice Brown"},
+            {"home": 0, "Joueurs": "Bob Jones"},
         ])
-        with self.assertRaisesRegex(ValueError, "ambigu"):
-            flashscore.filter_players(frame, {1: [player("Smith J.", "smith")], 0: []})
+        with self.assertLogs(level="WARNING") as logs:
+            result = flashscore.filter_players(frame, {
+                1: [player("Smith J.", "smith"), player("Brown A.", "brown-alice")],
+                0: [player("Jones B.", "jones-bob")],
+            })
+        self.assertEqual(result["Joueurs"].tolist(), ["Alice Brown", "Bob Jones"])
+        for name in ("Smith J.", "John Smith", "James Smith", "100"):
+            self.assertIn(name, " ".join(logs.output))
+
+    def test_duplicate_targets_exclude_all_claimants_independent_of_order(self):
+        frame = pd.DataFrame([
+            {"home": 1, "Joueurs": "John Smith"},
+            {"home": 1, "Joueurs": "Alice Brown"},
+            {"home": 0, "Joueurs": "Bob Jones"},
+        ])
+        claimants = [player("Smith J.", "smith-john"), player("Smith John", "smith-john")]
+        for order in (claimants, list(reversed(claimants))):
+            with self.assertLogs(level="WARNING") as logs:
+                result = flashscore.filter_players(frame, {
+                    1: order + [player("Brown A.", "brown-alice")],
+                    0: [player("Jones B.", "jones-bob")],
+                })
+            self.assertEqual(result["Joueurs"].tolist(), ["Alice Brown", "Bob Jones"])
+            for name in ("Smith J.", "Smith John", "John Smith"):
+                self.assertIn(name, " ".join(logs.output))
+
+    def test_coventry_ambiguity_keeps_only_reliable_matches(self):
+        names = ["Bobby Thomas", "Brandon Thomas-Asante", "Milan Van Ewijk", "Matt Grimes",
+                 "Jack Rudoni", "Ellis Simms", "Tatsuhiro Sakamoto", "Liam Kitching",
+                 "Jay Dasilva", "Victor Torp"]
+        frame = pd.DataFrame(
+            [{"home": 0, "Joueurs": name, "Equipe": "Coventry"} for name in names]
+            + [{"home": 1, "Joueurs": "Alice Brown", "Equipe": "Tottenham"}],
+        )
+        lineups = {
+            0: [player("Thomas B.", "thomas-bobby"),
+                player("Thomas-Asante B.", "thomas-asante-brandon")]
+                + [player(name, name.replace(" ", "-")) for name in names[2:]],
+            1: [player("Brown A.", "brown-alice")],
+        }
+        with self.assertLogs(level="INFO") as logs:
+            result = flashscore.filter_players(frame, lineups)
+        self.assertEqual(result.loc[result["home"] == 0, "Joueurs"].tolist(), names[1:])
+        self.assertIn("[Coventry] 9/10", " ".join(logs.output))
+        ambiguous_frame = pd.concat([
+            frame, pd.DataFrame([{"home": 0, "Joueurs": "Ben Thomas-Asante", "Equipe": "Coventry"}]),
+        ], ignore_index=True)
+        with self.assertLogs(level="INFO") as logs:
+            result = flashscore.filter_players(ambiguous_frame, lineups)
+        self.assertEqual(result.loc[result["home"] == 0, "Joueurs"].tolist(), names[2:])
+        self.assertIn("[Coventry] 8/10", " ".join(logs.output))
 
     def test_no_recognized_starter_fails(self):
         frame = pd.DataFrame([{"home": 1, "Joueurs": "Substitute"}])
@@ -121,6 +172,31 @@ def group_html(heading, prefix="starter", count=11, goalkeeper=True):
 
 
 class LocalDomTests(unittest.TestCase):
+    def test_calendar_counts_identify_each_competition(self):
+        urls = [
+            ("LDC", flashscore.COMPETITION_URL, "15.10. 21:00", 1),
+            ("L1", "https://www.flashscore.fr/football/france/ligue-1", "16.10. 21:00", 0),
+            ("PL", "https://www.flashscore.fr/football/angleterre/premier-league", "16.10. 21:00", 0),
+        ]
+        with wina_page(True) as page:
+            for label, url, kickoff, count in urls:
+                html = (
+                    '<div class="event__match"><span class="event__time">' + kickoff + '</span>'
+                    '<span class="event__homeParticipant">Home</span>'
+                    '<span class="event__awayParticipant">Away</span>'
+                    '<a href="/match/fixture">Match</a></div>'
+                )
+                page.route("https://www.flashscore.fr/**", lambda route: route.fulfill(
+                    content_type="text/html", body=html,
+                ))
+                with self.assertLogs(level="INFO") as logs:
+                    result = flashscore.discover_matches(
+                        page, date(2026, 10, 15), url, allow_empty=True,
+                    )
+                self.assertEqual(len(result), count)
+                self.assertIn(f"[FLASHSCORE][{label}] {count} matchs", " ".join(logs.output))
+                page.unroute("https://www.flashscore.fr/**")
+
     def test_empty_competition_calendar_is_normal_but_not_a_blank_page(self):
         with wina_page(True) as page:
             page.route("https://www.flashscore.fr/**", lambda route: route.fulfill(

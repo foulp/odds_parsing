@@ -83,6 +83,32 @@ class SelectionTests(unittest.TestCase):
 
 
 class AdapterTests(unittest.TestCase):
+    def test_discovery_browser_uses_paris_timezone(self):
+        with patch.object(discovery, "sync_playwright") as playwright:
+            browser = playwright.return_value.__enter__.return_value.chromium.launch.return_value
+            with discovery.discovery_page():
+                pass
+        browser.new_page.assert_called_once_with(timezone_id="Europe/Paris", locale="fr-FR")
+        browser.close.assert_called_once()
+
+    def test_missing_reference_skips_only_that_match_and_lists_candidates(self):
+        missing = dict(fixture("Fenerbahce", "Slavia Prague"), url="missing")
+        available = dict(fixture(), url="available")
+        issues = []
+        with patch.object(discovery, "discover_matches", return_value=[missing, available]), \
+                patch.object(discovery, "read_pmu_matches",
+                             return_value=[dict(missing, id=1), dict(available, id=123)]), \
+                patch.object(discovery, "read_winamax_matches",
+                             return_value=[dict(missing, id=2), dict(available, id=456)]), \
+                patch.object(discovery, "read_betclic_matches",
+                             return_value=[dict(available, url="https://betclic.test/available")]), \
+                self.assertLogs(level="ERROR"):
+            result = discovery.discover_competition(MagicMock(), MagicMock(), "l1", DAY, issues)
+        self.assertEqual([r["home"] for r in result], ["PSG"])
+        self.assertEqual(len(issues), 1)
+        for text in ("Fenerbahce", "BETCLIC", "PSG", "Marseille", "21:00"):
+            self.assertIn(text, issues[0])
+
     def test_no_fixtures_skips_all_bookmaker_requests(self):
         with patch.object(discovery, "discover_matches", return_value=[]), \
                 patch.object(discovery, "read_pmu_matches") as pmu, \
@@ -163,6 +189,32 @@ class AdapterTests(unittest.TestCase):
 
 
 class CacheTests(unittest.TestCase):
+    def test_partial_competition_is_retried_while_other_competitions_are_cached(self):
+        attempts = []
+
+        def discover(page, session, competition, today, issues):
+            attempts.append(competition)
+            if competition == "ldc":
+                issues.append("Missing BETCLIC match")
+                return [fixture("Available", "Opponent", "ldc")]
+            return [fixture()]
+
+        with TemporaryDirectory() as directory, patch.object(discovery, "discovery_page"), \
+                patch.object(discovery, "discover_competition", side_effect=discover):
+            issues = []
+            result = discovery.get_daily_matches(
+                ["ldc", "l1"], MagicMock(), today=DAY, cache_dir=directory, issues=issues,
+            )
+            self.assertEqual(len(result), 2)
+            self.assertEqual(issues, ["Missing BETCLIC match"])
+            payload = json.loads((Path(directory) / f"{DAY}.json").read_text())
+            self.assertNotIn("ldc", payload["competitions"])
+            self.assertIn("l1", payload["competitions"])
+            discovery.get_daily_matches(
+                ["ldc", "l1"], MagicMock(), today=DAY, cache_dir=directory, issues=[],
+            )
+            self.assertEqual(attempts, ["ldc", "l1", "ldc"])
+
     def test_refresh_only_rebuilds_selected_competitions(self):
         with TemporaryDirectory() as directory, patch.object(discovery, "discovery_page"), \
                 patch.object(discovery, "discover_competition", return_value=[]) as discover:

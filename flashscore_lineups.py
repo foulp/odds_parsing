@@ -47,11 +47,14 @@ def is_today(label, today):
 
 def discover_matches(page, today=None, competition_url=COMPETITION_URL, allow_empty=False):
     today = today or datetime.now(ZoneInfo("Europe/Paris")).date()
+    competition = competition_url.rstrip("/").split("/")[-1]
+    label = {"ligue-des-champions": "LDC", "ligue-1": "L1",
+             "premier-league": "PL"}.get(competition, competition)
     page.goto(competition_url, wait_until="domcontentloaded")
     rows = page.locator(".event__match")
     page.locator(".event__match, .noMatchFound").first.wait_for(timeout=20000)
     if not rows.count() and allow_empty:
-        logging.info("[FLASHSCORE] %s : calendrier vide pour le %s", competition_url, today)
+        logging.info("[FLASHSCORE][%s] Calendrier vide pour le %s", label, today)
         return []
     matches = rows.evaluate_all("""rows => rows.map(row => ({
         time: row.querySelector('.event__stageTime, .event__time')?.textContent.trim() || '',
@@ -70,7 +73,7 @@ def discover_matches(page, today=None, competition_url=COMPETITION_URL, allow_em
         ).isoformat()
     if not result and not allow_empty:
         raise ValueError(f"Aucun match Flashscore trouve pour le {today}")
-    logging.info("[FLASHSCORE] %s matchs trouves pour le %s", len(result), today)
+    logging.info("[FLASHSCORE][%s] %s matchs trouves pour le %s", label, len(result), today)
     return result
 
 
@@ -170,7 +173,8 @@ def filter_players(frame, lineups):
     selected = []
     for home in (1, 0):
         players = frame[frame["home"] == home]
-        used = set()
+        team = str(players.iloc[0]["Equipe"]) if not players.empty and "Equipe" in players else str(home)
+        proposals = {}
         for player in lineups[home]:
             ranked = sorted(
                 ((player_score(player, row["Joueurs"]), idx, row["Joueurs"])
@@ -178,19 +182,36 @@ def filter_players(frame, lineups):
                 key=lambda item: item[0], reverse=True,
             )
             if not ranked or ranked[0][0] < 85:
-                logging.warning("[FLASHSCORE] Equipe %s : %s absent du marche PMU ou non reconnu",
-                                home, player["name"])
+                logging.warning("[FLASHSCORE][%s] %s (%s) absent du marche PMU ou non reconnu ; candidats=%s",
+                                team, player["name"], player["href"],
+                                [(name, score) for score, _, name in ranked[:3]])
                 continue
             if len(ranked) > 1 and ranked[0][0] - ranked[1][0] < 5:
-                raise ValueError(f"Joueur Flashscore ambigu : {player['name']}")
+                logging.warning(
+                    "[FLASHSCORE][%s] Joueur ambigu exclu : %s (%s) ; candidats PMU=%s",
+                    team, player["name"], player["href"],
+                    [(name, score) for score, _, name in ranked if ranked[0][0] - score < 5],
+                )
+                continue
             score, idx, name = ranked[0]
-            if idx in used:
-                raise ValueError(f"Correspondance Flashscore dupliquee : {name}")
-            used.add(idx)
-            selected.append(idx)
-            logging.info("[FLASHSCORE] Equipe %s : %s -> %s (%s)", home, player["name"], name, score)
-        if not used:
+            proposals.setdefault(idx, []).append((player, score, name))
+        retained = []
+        for idx, candidates in proposals.items():
+            if len(candidates) > 1:
+                logging.warning(
+                    "[FLASHSCORE][%s] Correspondance dupliquee exclue : PMU=%s ; candidats Flashscore=%s",
+                    team, candidates[0][2],
+                    [(player["name"], player["href"], score) for player, score, _ in candidates],
+                )
+                continue
+            player, score, name = candidates[0]
+            retained.append(idx)
+            logging.info("[FLASHSCORE][%s] %s -> %s (%s)", team, player["name"], name, score)
+        logging.info("[FLASHSCORE][%s] %s/%s titulaires reconnus ; %s exclus du calcul",
+                     team, len(retained), len(lineups[home]), len(lineups[home]) - len(retained))
+        if not retained:
             raise ValueError(f"Aucun titulaire Flashscore reconnu dans l'equipe {home}")
+        selected.extend(retained)
     return frame.loc[frame.index.isin(selected)].reset_index(drop=True)
 
 

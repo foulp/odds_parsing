@@ -51,6 +51,7 @@ def discovery_page(headless=True):
         browser = p.chromium.launch(headless=headless)
         try:
             page = browser.new_page(timezone_id="Europe/Paris", locale="fr-FR")
+            logging.info("[DECOUVERTE] Navigateur : fuseau=Europe/Paris, langue=fr-FR")
             page.route("**/*", lambda r: r.abort() if r.request.resource_type in
                        ("image", "font", "media") else r.continue_())
             yield page
@@ -163,7 +164,14 @@ def read_betclic_matches(page, competition, today):
         start = datetime.combine(today, datetime.strptime(card["time"], "%H:%M").time(), PARIS)
         result.append({"home": teams[0], "away": teams[1], "start": start.isoformat(),
                        "url": card["url"]})
+    logging.info("[DECOUVERTE][%s][BETCLIC] %s cartes lues, %s rencontres pour le %s ; groupes=%s",
+                 competition.upper(), len(cards), len(result), today,
+                 sorted({card["date"] for card in cards}))
     return result
+
+
+class MissingMatchError(ValueError):
+    """No reliable candidate; distinct from an ambiguous association."""
 
 
 def associate_match(reference, candidates, bookmaker):
@@ -178,13 +186,20 @@ def associate_match(reference, candidates, bookmaker):
     ranked.sort(key=lambda item: item[0], reverse=True)
     name = f'{reference["home"]} - {reference["away"]}'
     if not ranked or ranked[0][0] < 75:
-        raise ValueError(f"{name} : rencontre {bookmaker} introuvable au meme horaire")
+        available = [(c["home"], c["away"], c["start"]) for c in candidates]
+        raise MissingMatchError(
+            f"{name} ({reference['start']}) : rencontre {bookmaker} introuvable au meme horaire ; "
+            f"candidats={available}"
+        )
     if len(ranked) > 1 and ranked[0][0] - ranked[1][0] < 10:
-        raise ValueError(f"{name} : rencontre {bookmaker} ambigue")
+        raise ValueError(
+            f"{name} : rencontre {bookmaker} ambigue ; candidats="
+            f"{[(c['home'], c['away'], c['start'], score) for score, c in ranked[:2]]}"
+        )
     return ranked[0][1]
 
 
-def discover_competition(page, session, competition, today):
+def discover_competition(page, session, competition, today, issues=None):
     fixtures = discover_matches(page, today, COMPETITIONS[competition]["flashscore"], allow_empty=True)
     if not fixtures:
         return []
@@ -193,11 +208,22 @@ def discover_competition(page, session, competition, today):
         "WINAMAX": read_winamax_matches(page, competition, today),
         "BETCLIC": read_betclic_matches(page, competition, today),
     }
+    logging.info("[DECOUVERTE][%s] Flashscore=%s ; references par bookmaker=%s",
+                 competition.upper(), len(fixtures), {name: len(rows) for name, rows in sources.items()})
     result = []
     used = {bookmaker: set() for bookmaker in sources}
     for fixture in fixtures:
-        matched = {bookmaker: associate_match(fixture, candidates, bookmaker)
-                   for bookmaker, candidates in sources.items()}
+        try:
+            matched = {bookmaker: associate_match(fixture, candidates, bookmaker)
+                       for bookmaker, candidates in sources.items()}
+        except MissingMatchError as exc:
+            if issues is None:
+                raise
+            message = f"[{competition.upper()}] {exc}"
+            issues.append(message)
+            logging.error("[DECOUVERTE] %s ; match ignore, nouvelle tentative au prochain passage",
+                          message)
+            continue
         record = {
             "competition": competition, "home": fixture["home"], "away": fixture["away"],
             "start": fixture["start"], "flashscore_url": fixture["url"],
@@ -261,7 +287,7 @@ def read_cache(path, today):
 
 
 def get_daily_matches(competitions, session, headless=True, queries=None, refresh=False,
-                      today=None, cache_dir=CACHE_DIR):
+                      today=None, cache_dir=CACHE_DIR, issues=None):
     today = today or datetime.now(PARIS).date()
     path = Path(cache_dir) / f"{today.isoformat()}.json"
     cache = {}
@@ -275,14 +301,23 @@ def get_daily_matches(competitions, session, headless=True, queries=None, refres
     if refresh:
         cache = {c: records for c, records in cache.items() if c not in competitions}
     missing = [c for c in competitions if c not in cache]
+    partial = {}
     if missing:
         with discovery_page(headless) as page:
             for competition in missing:
-                cache[competition] = discover_competition(page, session, competition, today)
+                errors = []
+                records = discover_competition(page, session, competition, today, issues=errors)
+                if errors:
+                    if issues is None:
+                        raise MissingMatchError("\n".join(errors))
+                    issues.extend(errors)
+                    partial[competition] = records
+                else:
+                    cache[competition] = records
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(".tmp")
         temporary.write_text(json.dumps({"version": 1, "date": today.isoformat(), "competitions": cache},
                                         ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(path)
     logging.info("[DECOUVERTE] References du %s : %s", today, path)
-    return select_matches([r for c in competitions for r in cache[c]], queries)
+    return select_matches([r for c in competitions for r in partial.get(c, cache.get(c, []))], queries)

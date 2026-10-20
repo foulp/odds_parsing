@@ -14,9 +14,16 @@ Sans argument, le script recherche uniquement les matchs du jour dans le fuseau
 `Europe/Paris`, en Ligue des Champions (`ldc`), Ligue 1 (`l1`) et Premier League
 (`pl`). Flashscore fournit le calendrier ; les references des bookmakers sont
 rapprochees dans la meme competition, avec les equipes dans le meme ordre et
-un ecart d'horaire maximal de 15 minutes. Une association absente, ambigue ou
-reutilisee provoque une erreur avant le calcul des cotes : aucune reference
-n'est devinee. Une competition sans rencontre aujourd'hui est ignoree normalement.
+un ecart d'horaire maximal de 15 minutes. Une association absente est signalee
+avec les candidats disponibles et leurs horaires : seule cette rencontre est
+ignoree, les autres restent analysees. La competition incomplete n'est pas
+mise en cache ; ses references seront recherchees au prochain passage.
+Les autres competitions completes restent en cache. Une association ambigue ou
+reutilisee reste bloquante : aucune reference n'est devinee.
+Une competition sans rencontre aujourd'hui est ignoree normalement.
+Les journaux de calendrier identifient la competition (`[LDC]`, `[L1]`, `[PL]`).
+Le navigateur de decouverte utilise explicitement `Europe/Paris` et `fr-FR` ;
+les journaux Betclic indiquent les groupes de dates lus et le nombre de rencontres.
 
 Les URL des competitions et les chemins de l'API publique PMU sont regroupes
 dans `COMPETITIONS` dans [match_discovery.py](./match_discovery.py).
@@ -86,6 +93,14 @@ python3 master_odds_parser.py -c ldc --flashscore
 
 Les compositions sont relues a chaque analyse, meme si les references sont en
 cache. Une relance apres leur publication applique donc les titulaires officiels.
+Un nom de titulaire ambigu n'arrete plus le match : il est exclu du calcul,
+avec tous les candidats PMU proches et leurs scores dans le journal.
+Si plusieurs titulaires ciblent un meme joueur PMU, tous ces rapprochements
+sont exclus, independamment de l'ordre des joueurs. Seuls les rapprochements
+non ambigus sont conserves ; les journaux donnent le nombre de titulaires
+reconnus par equipe. Une equipe sans aucun titulaire reconnu reste une erreur.
+La composition officielle doit toujours etre complete sur Flashscore :
+ce traitement partiel concerne uniquement son rapprochement avec le marche PMU.
 
 ### Taches planifiees : uniquement les compositions officielles
 
@@ -213,7 +228,9 @@ Un bloc **Dernier passage** en `J2:K10` est actualise a chaque fin d'execution,
 y compris sans activite, avec les horaires, le statut et les compteurs.
 Les colonnes J et K sont reservees a ce bloc, hors du tri de l'historique A:H.
 Les anciennes lignes sont conservees sans nettoyage retroactif.
-Une erreur de decouverte est indiquee dans le statut
+Une rencontre sans reference lors de la decouverte est comptee en erreur
+et detaillee dans le bilan, sans empecher les autres rencontres d'etre exportees.
+Une erreur technique globale de decouverte est indiquee dans le statut
 et le detail, sans etre comptee comme un match en erreur.
 Il s'agit d'un bilan de fin de lancement, pas d'une notification ni d'un statut
 en temps reel. Un arret brutal ou une panne d'acces Google peut empecher son
@@ -230,7 +247,8 @@ a 4000 caracteres dans Sheets ; les traces completes restent dans le journal.
 Une erreur de traitement sur un match n'annule pas les autres matchs du lot :
 tous sont executes, puis le lancement se termine avec le statut
 `Termine avec erreurs` si au moins un a echoue. Une erreur avant le lancement
-du lot (nettoyage, lecture de l'etat ou decouverte) empeche en revanche son analyse.
+du lot (nettoyage, lecture de l'etat ou erreur technique globale de decouverte)
+empeche en revanche son analyse.
 
 ### Nettoyage quotidien des onglets de matchs
 
