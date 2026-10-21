@@ -2,6 +2,7 @@
 
 Seules les compositions officielles filtrent par defaut ; allow_probable accepte
 aussi les probables. Une absence normale ne filtre pas, une erreur reste bloquante.
+Le resultat indique son type (Lineups.kind) : officielles ou probables.
 """
 
 from datetime import datetime
@@ -28,6 +29,10 @@ TEAM_ALIASES = {
     "paris saint germain fc": "psg",
     "roma": "as rome",
     "as roma": "as rome",
+    # Flashscore "Club Brugge", Winamax/Betclic "Club Bruges", PMU "FC Bruges".
+    "club brugge": "bruges",
+    "club bruges": "bruges",
+    "fc bruges": "bruges",
 }
 
 
@@ -101,6 +106,14 @@ def composition_url(url):
     return urlunsplit((parts.scheme, parts.netloc, path, parts.query, ""))
 
 
+class Lineups(dict):
+    """Joueurs de champ par cote (1 domicile, 0 exterieur) ; kind : officielles ou probables."""
+
+    def __init__(self, kind, teams=()):
+        super().__init__(teams)
+        self.kind = kind
+
+
 def read_lineups(page, url, allow_probable=False):
     page.goto(composition_url(url), wait_until="domcontentloaded")
     groups = page.locator('[data-testid="wcl-lineupsGroup"]')
@@ -117,14 +130,15 @@ def read_lineups(page, url, allow_probable=False):
         return None
     if official.count():
         starters = official
+        result = Lineups("officielles")
     elif probable.count():
         if not allow_probable:
             logging.info("[FLASHSCORE] %s : composition probable uniquement ; aucun filtre", url)
             return None
         starters = probable
+        result = Lineups("probables")
     else:
         raise ValueError(f"Etat des compositions Flashscore non reconnu : {url}")
-    result = {}
     for home, side in ((1, "left"), (0, "right")):
         rows = starters.locator(f'[data-testid="wcl-lineupsParticipantGeneral-{side}"]')
         expect(rows).to_have_count(11, timeout=15000)

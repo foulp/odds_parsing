@@ -130,7 +130,9 @@ celles dont les compositions officielles ne sont pas encore publiees. Seules
 deux compositions completes valides declenchent l'analyse et l'export, avec
 10 joueurs de champ par equipe. Le coup d'envoi est reverifie au demarrage
 du traitement et apres la lecture des compositions. Un traitement deja lance
-n'est pas interrompu si le match commence pendant le calcul des cotes.
+n'est pas interrompu si le match commence pendant le calcul des cotes ; si
+Winamax ferme alors son marche, le match est compte parmi les ignores, sans
+export ni erreur.
 Une erreur technique ou une composition incomplete reste une erreur, pas une
 absence normale. `--flashscore`, qui accepte les probables, est incompatible.
 
@@ -158,9 +160,20 @@ python3 master_odds_parser.py --scheduled -c l1 pl
 ```
 
 Ce mode effectue un seul passage puis se termine. Il utilise le cache quotidien
-et ne traite que les rencontres dont le coup d'envoi est strictement a venir,
-dans les **90 prochaines minutes incluses**. Il impose les compositions
+et ne traite que les rencontres dont le coup d'envoi est strictement a venir.
+Dans les **90 prochaines minutes incluses**, il impose les compositions
 officielles completes : sans elles, le match attend le prochain passage.
+
+Plus de 90 minutes avant le coup d'envoi, des le premier passage du jour, chaque
+match recoit **un export sur compositions probables** Flashscore. Il est retente
+a chaque passage tant que les probables ne sont pas publiees ou que le marche
+Joueur decisif Winamax n'est pas ouvert, sans ligne d'historique Executions ; les
+cotes simples incompletes ne le bloquent pas. Si Flashscore affiche deja les
+officielles, l'export attend la fenetre des 90 minutes. Ces exports sont
+memorises a part dans `.match-cache/exported-probables.json` : l'export officiel
+a toujours lieu ensuite. Dans un passage, les matchs officiels passent avant.
+La colonne **Compositions** indique `probables`, `officielles` ou `aucune`
+(mode manuel sans filtre) ; elle est ajoutee, vide, aux onglets plus anciens.
 Sans rencontre eligible, aucun navigateur d'analyse n'est ouvert ; le premier
 passage du jour peut toutefois ouvrir le navigateur pour decouvrir les references.
 Le bilan dans l'onglet Executions necessite toujours un acces Google.
@@ -194,10 +207,12 @@ avec la raison dans le detail (`Differe : ...`) ; le match
 est compte parmi les ignores. Sans `--scheduled`, les exports partiels habituels
 restent autorises.
 
-Si la lecture MyMatch echoue, le marche Winamax est recharge et la meme
-combinaison retentee une fois. Une recuperation impossible arrete le match sans
-exporter les calculs partiels ; le journal conserve la combinaison et la cause.
-En mode planifie, le match reste eligible au prochain passage avant le coup d'envoi.
+Si la lecture MyMatch echoue (socket ferme, reponse absente ou incoherente), la
+connexion Winamax est rouverte et la meme combinaison retentee une fois. Une
+recuperation impossible arrete le match sans exporter les calculs partiels ; le
+journal conserve la combinaison et la cause. En mode planifie, le match reste
+eligible au prochain passage avant le coup d'envoi. Une combinaison refusee
+explicitement par Winamax reste sans cote Wina, avec un avertissement.
 
 Le succes est enregistre apres le retour de l'export Sheets. Un arret brutal
 entre l'ecriture Sheets et la sauvegarde locale, ou un export partiellement
@@ -318,21 +333,21 @@ Un nettoyage termine ne modifie pas la memoire des matchs deja exportes.
 
 ## Validation hors ligne
 
-Pour les combinaisons Winamax, le panier est vide avant chaque calcul. Chaque
-clic est confirme par le nombre et les noms exacts des lignes Joueur decisif
-dans l'unique item MyMatch (le compteur global peut afficher une seule selection
-pour un duo ou un trio).
-Les espaces de mise en page autour et entre les mots des joueurs sont toleres,
-mais pas les noms differents ou les joueurs supplementaires.
-La cote finale doit etre stable sur trois lectures
-espacees de 0,5 seconde. Une incoherence declenche la reconstruction et une
-nouvelle tentative du combo ; un second echec arrete le match.
+Winamax est lu sans clic ni panier ([winamax_odds.py](./winamax_odds.py)) : la
+page du match est chargee une fois, puis une connexion socket.io dediee, ouverte
+depuis cette page, recoit le marche Joueur decisif (identifiants, equipes et
+cotes simples) et demande chaque combinaison par `GetOdds`, comme le fait le
+panier MyMatch du site (~50 ms par reponse, pause de 0,2 s entre deux demandes).
+Une reponse doit couvrir exactement les selections demandees : un doublon,
+renvoye par Winamax comme une cote simple, est rejete. Une fermeture du marche
+ou un changement de statut de la rencontre (coup d'envoi) arrete les demandes.
 
 ```bash
 python3 -m unittest -q test_match_discovery test_flashscore_lineups \
   test_name_matching test_master_odds_parser test_betclic_odds test_executions \
-  test_scheduled_runs test_sheets_cleanup
+  test_scheduled_runs test_sheets_cleanup test_winamax_odds
 ```
 
-Certains tests utilisent Chromium localement sur des pages HTML de test.
+Certains tests utilisent Chromium localement sur des pages HTML de test ou un
+faux serveur socket.io.
 Aucun test n'effectue de pari ou d'ecriture Google Sheets.

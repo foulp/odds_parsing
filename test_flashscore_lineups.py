@@ -28,6 +28,12 @@ class MatchingTests(unittest.TestCase):
             with self.subTest(home=home, away=away):
                 self.assertEqual(flashscore.find_match(matches, home, away)["url"], expected)
 
+    def test_bruges_names_of_every_site_are_one_team(self):
+        matches = [{"home": "Club Brugge", "away": "Lens", "url": "brugge-lens"}]
+        for home in ("FC Bruges", "Club Bruges", "Club Brugge"):
+            with self.subTest(home=home):
+                self.assertEqual(flashscore.find_match(matches, home, "Lens")["url"], "brugge-lens")
+
     def test_aliases_do_not_remove_category_suffixes(self):
         self.assertEqual(flashscore.normalize_team("Paris SG"), "psg")
         self.assertNotEqual(flashscore.normalize_team("Paris SG U19"), "psg")
@@ -214,6 +220,9 @@ class LocalDomTests(unittest.TestCase):
                     ))
                     lineups = flashscore.read_lineups(page, "https://fixture.test/match/a?mid=1",
                                                       allow_probable=True)
+                    self.assertEqual(lineups.kind, "probables" if "probables" in heading
+                                     else "officielles")
+                    self.assertEqual(set(lineups), {1, 0})
                     for home, side in ((1, "left"), (0, "right")):
                         self.assertEqual(len(lineups[home]), 10)
                         self.assertEqual(lineups[home][0]["name"], f"starter {side} 1")
@@ -245,6 +254,7 @@ class LocalDomTests(unittest.TestCase):
             ))
             result = flashscore.read_lineups(page, "https://fixture.test/match/a", allow_probable=True)
             self.assertTrue(result[1][0]["name"].startswith("official"))
+            self.assertEqual(result.kind, "officielles")
 
     def test_missing_groups_only_count_as_absent_on_loaded_match_without_compo_tab(self):
         page = MagicMock()

@@ -1,7 +1,7 @@
 """References des rencontres du jour, rapprochees par competition et horaire."""
 
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 from pathlib import Path
@@ -117,7 +117,9 @@ def betclic_date(label, now):
     text = normalize_name(label)
     for word, delta in (("aujourd hui", 0), ("demain", 1), ("apres demain", 2), ("hier", -1)):
         if text == word:
-            return now.date() + timedelta(days=delta)
+            # Betclic calcule ces libelles sur le jour UTC : entre minuit et 2h (Paris, ete),
+            # les matchs du jour y sont encore groupes sous "Demain".
+            return now.astimezone(timezone.utc).date() + timedelta(days=delta)
     numeric = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{4}))?\b", label)
     if numeric:
         result = now.date().replace(year=int(numeric[3] or now.year),

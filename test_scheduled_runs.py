@@ -51,20 +51,49 @@ class ScheduledRunTests(unittest.TestCase):
             with self.subTest(flags=flags), patch("sys.stderr"), self.assertRaises(SystemExit):
                 parser.parse_args(["--scheduled"] + flags)
 
-    def test_window_includes_90_minutes_but_excludes_started_and_distant_matches(self):
-        records = [match(1, -1), match(2, 0), match(3, 90), match(4, 91)]
-        counts, process = self.run_matches(records, ["exported"])
-        self.assertEqual(counts["exported"], 1)
-        self.assertEqual(counts["ignored"], 3)
-        self.assertEqual(process.call_args.args[0], 3)
-        self.assertTrue(process.call_args.args[3].official_lineups_only)
-        self.assertEqual(process.call_args.kwargs["match_start"], records[2]["start"])
+    def test_official_window_is_90_minutes_and_distant_matches_get_probables(self):
+        records = [match(1, -1), match(4, 91), match(2, 0), match(3, 90)]
+        counts, process = self.run_matches(records, lambda *args, **kwargs: "exported")
+        self.assertEqual((counts["exported"], counts["ignored"]), (2, 2))
+        calls = {c.args[0]: c for c in process.call_args_list}
+        self.assertEqual(set(calls), {3, 4})
+        self.assertNotIn("probable", calls[3].kwargs)
+        self.assertTrue(calls[4].kwargs["probable"])
+        self.assertTrue(calls[3].args[3].official_lineups_only)
+        self.assertEqual(calls[3].kwargs["match_start"], records[3]["start"])
+        # Le match officiel est soumis en premier (aucun delai de desynchronisation).
+        self.assertEqual(calls[3].args[5], 0)
+        self.assertGreater(calls[4].args[5], 0)
+        self.assertIn("Exporte (probables) : PMU 4 / Winamax 4", counts["detail"])
+        self.assertTrue(scheduled_runs.ExportedMatches().contains(3))
+        self.assertFalse(scheduled_runs.ExportedMatches().contains(4))
+        self.assertTrue(scheduled_runs.ExportedMatches(parser.PROBABLE_EXPORTS).contains(4))
 
     def test_quiet_run_never_starts_workers(self):
+        scheduled_runs.ExportedMatches(parser.PROBABLE_EXPORTS).mark_exported(1)
         counts, process = self.run_matches([match(1, 91), match(2, -10)], [])
         process.assert_not_called()
         self.assertEqual(counts["ignored"], 2)
         self.assertFalse((self.cache / "exported.json").exists())
+
+    def test_probable_export_once_then_official_export_in_the_window(self):
+        self.run_matches([match(1, 180)], ["exported"])
+        counts, process = self.run_matches([match(1, 165)], [])
+        process.assert_not_called()
+        self.assertEqual(counts["ignored"], 1)
+        counts, process = self.run_matches([match(1, 60)], ["exported"])
+        self.assertNotIn("probable", process.call_args.kwargs)
+        self.assertEqual(counts["exported"], 1)
+        self.assertTrue(scheduled_runs.ExportedMatches().contains(1))
+
+    def test_probable_deferrals_are_retried_without_history_lines(self):
+        counts, _ = self.run_matches([match(1, 180)], [parser.OddsNotReady("marche ferme")])
+        self.assertEqual((counts["ignored"], counts["failed"], counts["exported"]), (1, 0, 0))
+        self.assertNotIn("deferred", counts)
+        self.assertEqual(counts["detail"], "")
+        self.assertFalse(scheduled_runs.ExportedMatches(parser.PROBABLE_EXPORTS).contains(1))
+        _, process = self.run_matches([match(1, 165)], ["exported"])
+        self.assertTrue(process.call_args.kwargs["probable"])
 
     def test_success_is_persisted_and_next_run_skips_it(self):
         self.run_matches([match(1, 30)], ["exported"])

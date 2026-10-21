@@ -28,8 +28,10 @@ def run_lock():
 
 
 class ExportedMatches:
-    def __init__(self):
-        self.path = CACHE_DIR / "exported.json"
+    """Identifiants PMU exportes ; un fichier par type d'export (officiel, probable)."""
+
+    def __init__(self, filename="exported.json"):
+        self.path = CACHE_DIR / filename
         self.exported = set()
         if self.path.exists():
             payload = json.loads(self.path.read_text(encoding="utf-8"))

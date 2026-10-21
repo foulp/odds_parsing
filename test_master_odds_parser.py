@@ -1,13 +1,13 @@
 from datetime import datetime, timedelta
 from itertools import combinations
 import argparse
-from types import SimpleNamespace
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pandas as pd
 import requests
 
+from flashscore_lineups import Lineups
 import master_odds_parser as parser
 
 
@@ -24,6 +24,14 @@ def players_frame():
         {"Match": "Home - Away", "Equipe": "Away", "home": 0, "Taille Combi": 1,
          "Joueurs": "Eve", "outcome_id": "5", "Cote PMU": 3.0},
     ], index=["a", "b", "c", "d", "e"])
+
+
+def wina_market(players, quotes=()):
+    """Faux WinamaxMyMatch : simples lus sur le socket puis cotes MyMatch."""
+    market = MagicMock()
+    market.read_players.return_value = players
+    market.quote.side_effect = list(quotes)
+    return market
 
 
 class CombinationTests(unittest.TestCase):
@@ -158,8 +166,7 @@ class OddsReadinessTests(unittest.TestCase):
 
     def test_wina_missing_single_defers_before_combination_requests(self):
         with patch.object(parser, "wina_page"), \
-                patch.object(parser, "prepare_wina_market"), \
-                patch.object(parser, "extract_wina_players", return_value=({}, [])), \
+                patch.object(parser, "WinamaxMyMatch", return_value=wina_market([])), \
                 patch.object(parser, "get_pmu_combi_odds") as quote, \
                 self.assertRaises(parser.OddsNotReady):
             parser.run_master_wina_and_pmu(
@@ -167,24 +174,50 @@ class OddsReadinessTests(unittest.TestCase):
             )
         quote.assert_not_called()
 
-    def test_failed_recovery_keeps_combination_context_and_original_error(self):
-        frame = players_frame().iloc[:2]
-        wina = [{"Nom": p["Joueurs"], "home": 1, "Cote": 2.0}
-                for p in frame.to_dict("records")]
-        failure = parser.PlaywrightTimeoutError("Joueur decisif absent")
+    def test_missing_wina_market_defers_or_keeps_pmu_only(self):
         with patch.object(parser, "wina_page"), \
-                patch.object(parser, "prepare_wina_market"), \
-                patch.object(parser, "extract_wina_players", return_value=({}, wina)), \
-                patch.object(parser, "get_pmu_combi_odds", return_value=6.5), \
-                patch.object(parser, "read_wina_combination",
-                             side_effect=parser.PlaywrightTimeoutError("basket")), \
-                patch.object(parser, "recover_wina_market", side_effect=failure), \
-                patch.object(parser.time, "sleep"), self.assertLogs(level="WARNING"), \
-                self.assertRaisesRegex(RuntimeError, "Alice - Bob.*sans export") as error:
-            parser.run_master_wina_and_pmu("url", 123, frame, [2], 4, 1.15)
-        self.assertIs(error.exception.__cause__, failure)
+                patch.object(parser, "WinamaxMyMatch", return_value=wina_market(None)), \
+                patch.object(parser, "get_pmu_combi_odds") as quote:
+            with self.assertRaisesRegex(parser.OddsNotReady, "Joueur decisif"):
+                parser.run_master_wina_and_pmu(
+                    "url", 123, players_frame(), [2], 4, 1.15, require_complete=True,
+                )
+            with self.assertLogs(level="WARNING"):
+                pmu, wina = parser.run_master_wina_and_pmu("url", 123, players_frame(), [2], 4, 1.15)
+        self.assertEqual(pmu["Joueurs"].tolist(), players_frame()["Joueurs"].tolist())
+        self.assertTrue(wina.empty)
+        quote.assert_not_called()
 
-    def run_scheduled_match(self, missing=None, minutes_before=24 * 60, lineups_seen=True):
+    def test_kickoff_during_processing_is_ignored_not_deferred(self):
+        start = datetime.now(parser.PARIS) + timedelta(minutes=20)
+        clock = [start - timedelta(minutes=20)]
+
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return clock[0]
+
+        def market_closes_at_kickoff(*args, **kwargs):
+            clock[0] = start + timedelta(seconds=1)
+            raise parser.OddsNotReady("Marche Joueur décisif ferme sur Winamax")
+
+        with patch.object(parser, "datetime", Clock), \
+                patch.object(parser, "get_pmu_players_dict", return_value=players_frame()), \
+                patch.object(parser, "get_match_lineups", return_value=Lineups("officielles")), \
+                patch.object(parser, "filter_players", side_effect=lambda frame, _: frame), \
+                patch.object(parser, "run_master_wina_and_pmu", side_effect=market_closes_at_kickoff), \
+                patch.object(parser, "export_to_google_sheets") as export, \
+                self.assertLogs(level="INFO") as logs:
+            result = parser.process_single_match(
+                123, 456, "", parser.parse_args(["--scheduled"]), "key.json", 0,
+                flashscore_url="https://fixture.test", match_start=start.isoformat(),
+            )
+        self.assertEqual(result, "ignored")
+        export.assert_not_called()
+        self.assertIn("coup d'envoi atteint pendant le traitement", " ".join(logs.output))
+
+    def run_scheduled_match(self, missing=None, minutes_before=24 * 60, lineups_seen=True,
+                            kind="officielles", probable=False):
         singles = pd.DataFrame([
             dict(players_frame().iloc[0], home=home, Joueurs=f"Player {home} {i}",
                  outcome_id=str(home * 10 + i))
@@ -209,23 +242,55 @@ class OddsReadinessTests(unittest.TestCase):
             quotes = quotes[quotes["Taille Combi"] == 1]
         elif missing == "wina_combo":
             wina = wina[wina["Taille Combi"] == 1]
+        elif missing == "wina_market":
+            wina = pd.DataFrame()
         start = datetime.now(parser.PARIS) + timedelta(minutes=minutes_before)
         args = parser.parse_args(["--scheduled"])
         with patch.object(parser, "get_pmu_players_dict", return_value=singles), \
-                patch.object(parser, "get_match_lineups", return_value={}), \
+                patch.object(parser, "get_match_lineups",
+                             return_value=kind and Lineups(kind)) as get_lineups, \
                 patch.object(parser, "filter_players", side_effect=lambda frame, _: frame), \
                 patch.object(parser, "run_betclic_extraction", return_value=quotes), \
                 patch.object(parser, "run_master_wina_and_pmu",
                              return_value=(final, wina)) as pipeline, \
                 patch.object(parser, "export_to_google_sheets") as export, \
                 patch.object(parser.time, "sleep"):
-            self.pipeline = pipeline
+            self.pipeline, self.get_lineups = pipeline, get_lineups
             result = parser.process_single_match(
                 123, 456, "https://betclic.test", args, "key.json", 0,
                 flashscore_url="https://fixture.test", match_start=start.isoformat(),
-                lineups_seen=lineups_seen,
+                lineups_seen=lineups_seen, **({"probable": True} if probable else {}),
             )
         return result, pipeline, export
+
+    def test_official_export_is_labelled_and_never_accepts_probables(self):
+        result, _, export = self.run_scheduled_match()
+        self.assertEqual(result, "exported")
+        self.assertFalse(self.get_lineups.call_args.kwargs["allow_probable"])
+        self.assertEqual(set(export.call_args.args[0]["Compositions"]), {"officielles"})
+
+    def test_probable_export_neither_waits_for_stability_nor_complete_singles(self):
+        with self.assertNoLogs(level="WARNING"):
+            result, pipeline, export = self.run_scheduled_match(
+                "pmu_single", lineups_seen=False, kind="probables", probable=True,
+            )
+        self.assertEqual(result, "exported")
+        self.assertTrue(self.get_lineups.call_args.kwargs["allow_probable"])
+        self.assertNotIn("require_complete", pipeline.call_args.kwargs)
+        self.assertEqual(set(export.call_args.args[0]["Compositions"]), {"probables"})
+
+    def test_probable_export_waits_for_probables_and_for_the_winamax_market(self):
+        for kind in (None, "officielles"):
+            with self.subTest(kind=kind), self.assertLogs(level="INFO") as logs:
+                result, pipeline, export = self.run_scheduled_match(kind=kind, probable=True)
+                self.assertEqual(result, "ignored")
+                pipeline.assert_not_called()
+                export.assert_not_called()
+            self.assertIn("non publiees" if kind is None else "officielles deja publiees",
+                          " ".join(logs.output))
+        with self.assertRaisesRegex(parser.OddsNotReady, "pas encore ouvert"), \
+                self.assertLogs(level="INFO"):
+            self.run_scheduled_match("wina_market", kind="probables", probable=True)
 
     def test_missing_pmu_single_defers_before_pipeline(self):
         with self.assertRaisesRegex(parser.OddsNotReady, "Player 1 0"), \
@@ -306,148 +371,52 @@ class PmuTests(unittest.TestCase):
         self.assertEqual(session.get.call_args.kwargs["timeout"], parser.PMU_TIMEOUT)
 
 
-class BrowserTests(unittest.TestCase):
-    def test_expansion_failure_is_retried_and_never_silently_accepted(self):
-        tableau = MagicMock()
-        button = tableau.locator.return_value.get_by_text.return_value.first
-        button.count.return_value = 1
-        button.is_visible.return_value = True
-        button.click.side_effect = parser.PlaywrightTimeoutError("intercepted")
-        with self.assertLogs(level="WARNING"), self.assertRaisesRegex(RuntimeError, "non entierement"):
-            parser.expand_wina_team(tableau, 1)
-        self.assertEqual(button.click.call_count, 3)
-        button.click.assert_called_with(timeout=10000)
-
-    def test_recovery_rebuilds_market_and_verifies_empty_basket(self):
-        page, tableaux, button = MagicMock(), MagicMock(), MagicMock()
-        with patch.object(parser, "prepare_wina_market", return_value=tableaux) as prepare, \
-                patch.object(parser, "extract_wina_players",
-                             return_value=({"Alice": button}, [])) as extract:
-            result = parser.recover_wina_market(page, ["Alice"])
-        page.reload.assert_called_once()
-        prepare.assert_called_once_with(page)
-        extract.assert_called_once_with(tableaux)
-        button.wait_for.assert_called_once_with(state="visible", timeout=10000)
-        basket = page.locator.return_value
-        basket.get_by_text.return_value.wait_for.assert_called_once_with(
-            state="visible", timeout=10000,
-        )
-        self.assertEqual(result, (tableaux, {"Alice": button}))
-        page.evaluate.assert_not_called()
-
-    def test_recovery_fails_explicitly_if_player_stays_missing(self):
-        with patch.object(parser, "prepare_wina_market"), \
-                patch.object(parser, "extract_wina_players", return_value=({}, [])), \
-                self.assertRaisesRegex(ValueError, "Alice"):
-            parser.recover_wina_market(MagicMock(), ["Alice"])
-
-    def test_same_combination_is_retried_after_recovery(self):
-        self.check_combination_recovery(persistent_failure=False)
+class WinamaxQuoteTests(unittest.TestCase):
+    def test_same_combination_is_retried_after_reconnection(self):
+        market = wina_market([], [parser.WinamaxSocketError("socket ferme"), 6.0])
+        with self.assertLogs(level="WARNING") as logs:
+            self.assertEqual(parser.quote_wina_combination(market, [1, 2], "Alice - Bob", "M"), 6.0)
+        self.assertEqual(market.quote.call_args_list, [call([1, 2]), call([1, 2])])
+        market.reconnect.assert_called_once()
+        self.assertIn("Echec tentative 1/2 pour Alice - Bob", logs.output[0])
 
     def test_persistent_failure_stops_instead_of_cascading(self):
-        self.check_combination_recovery(persistent_failure=True)
+        second = ValueError("Reponse MyMatch incoherente")
+        market = wina_market([], [parser.WinamaxSocketError("aucune reponse"), second])
+        with self.assertLogs(level="WARNING"), \
+                self.assertRaisesRegex(RuntimeError, "Alice - Bob; arret du match") as error:
+            parser.quote_wina_combination(market, [1, 2], "Alice - Bob", "M")
+        self.assertIs(error.exception.__cause__, second)
+        self.assertEqual(market.quote.call_count, 2)
 
-    def check_combination_recovery(self, persistent_failure):
-        frame = players_frame().iloc[:2]
-        wina = [{"Nom": p["Joueurs"], "home": 1, "Cote": 2.0}
-                for p in frame.to_dict("records")]
-        initial, recovered = MagicMock(), MagicMock()
-        failures = [parser.PlaywrightError("Element is not attached to the DOM"),
-                    parser.PlaywrightTimeoutError("still missing") if persistent_failure else 6.0]
-        with patch.object(parser, "wina_page"), \
-                patch.object(parser, "prepare_wina_market", return_value=initial), \
-                patch.object(parser, "extract_wina_players", return_value=({}, wina)), \
-                patch.object(parser, "get_pmu_combi_odds", return_value=6.5), \
-                patch.object(parser, "read_wina_combination", side_effect=failures) as read, \
-                patch.object(parser, "recover_wina_market", return_value=(recovered, {})) as recover, \
-                patch.object(parser.time, "sleep"), self.assertLogs(level="WARNING"):
-            if persistent_failure:
-                with self.assertRaisesRegex(RuntimeError, "arret du match"):
-                    parser.run_master_wina_and_pmu("url", 123, frame, [2], 4, 1.15)
-            else:
-                _, result = parser.run_master_wina_and_pmu("url", 123, frame, [2], 4, 1.15)
-                combo = result[result["Taille Combi"] == 2]
-                self.assertEqual(combo["Cote Wina"].tolist(), [6.0])
-                self.assertEqual(combo["Joueurs"].tolist(), ["Alice - Bob"])
-        self.assertEqual(read.call_count, 2)
-        self.assertIs(read.call_args_list[0].args[1], initial)
-        self.assertIs(read.call_args_list[1].args[1], recovered)
-        recover.assert_called_once()
+    def test_failed_recovery_keeps_combination_context_and_original_error(self):
+        failure = parser.WinamaxSocketError("Connexion socket Winamax impossible")
+        market = wina_market([], [parser.WinamaxSocketError("socket ferme")])
+        market.reconnect.side_effect = failure
+        with self.assertLogs(level="WARNING"), \
+                self.assertRaisesRegex(RuntimeError, "Alice - Bob.*sans export") as error:
+            parser.quote_wina_combination(market, [1, 2], "Alice - Bob", "M")
+        self.assertIs(error.exception.__cause__, failure)
 
-    def test_quote_refreshes_buttons_and_waits_for_empty_basket(self):
-        page = MagicMock()
-        basket = page.locator.return_value
-        items = basket.locator.return_value
-        items.locator.return_value.first.inner_text.return_value = "6,5"
-        alice, bob = MagicMock(), MagicMock()
-        with patch.object(parser, "extract_wina_players",
-                          return_value=({"Alice": alice, "Bob": bob}, [])) as extract, \
-                patch.object(parser, "expect") as assertion, \
-                patch.object(parser.time, "sleep"):
-            self.assertEqual(parser.read_wina_combination(page, "tables", ["Alice", "Bob"]), 6.5)
-        self.assertEqual(extract.call_count, 2)
-        extract.assert_called_with("tables")
-        alice.click.assert_called_once_with(force=True, timeout=10000)
-        bob.click.assert_called_once_with(force=True, timeout=10000)
-        self.assertEqual(basket.get_by_text.return_value.wait_for.call_count, 2)
-        items.locator.assert_any_call(".odds-indicator-value > div")
-        self.assertEqual(assertion.return_value.to_have_text.call_count, 5)
+    def test_refused_combination_is_skipped_without_reconnection(self):
+        market = wina_market([], [parser.MyMatchRefused("MyMatch refuse par Winamax : -7")])
+        with self.assertLogs(level="WARNING") as logs:
+            self.assertIsNone(parser.quote_wina_combination(market, [1, 2], "Alice - Bob", "M"))
+        market.reconnect.assert_not_called()
+        self.assertIn("[M] Alice - Bob : MyMatch refuse", logs.output[0])
 
-    def test_clear_uses_named_control_not_arbitrary_svg(self):
-        page = MagicMock()
-        basket = page.locator.return_value
-        basket.get_by_text.return_value.is_visible.return_value = False
-        parser.clear_wina_basket(page)
-        basket.get_by_role.assert_called_once_with(
-            "button", name="Effacer et continuer", exact=True,
-        )
-        basket.get_by_role.return_value.click.assert_called_once_with(
-            timeout=10000,
-        )
-        basket.get_by_text.return_value.wait_for.assert_called_once_with(
-            state="visible", timeout=10000,
-        )
+    def test_closed_market_is_not_ready_rather_than_an_error(self):
+        closed = parser.WinamaxMarketClosed("statut PREMATCH -> LIVE")
+        market = wina_market([], [closed])
+        with self.assertRaisesRegex(parser.OddsNotReady, "LIVE"):
+            parser.quote_wina_combination(market, [1, 2], "Alice - Bob", "M")
+        market = wina_market([], [parser.WinamaxSocketError("socket ferme")])
+        market.reconnect.side_effect = closed
+        with self.assertLogs(level="WARNING"), self.assertRaisesRegex(parser.OddsNotReady, "LIVE"):
+            parser.quote_wina_combination(market, [1, 2], "Alice - Bob", "M")
 
-    def test_one_dom_read_per_team_and_original_button_indices(self):
-        tableaux = MagicMock()
-        tableaux.count.return_value = 2
-        home, away = MagicMock(), MagicMock()
-        tableaux.nth.side_effect = lambda i: SimpleNamespace(locator=lambda _: [home, away][i])
-        home.evaluate.return_value = {
-            "names": ["Alice", "Bob"], "odds": ["1", "2", "3,5", "1", "2", "4"], "buttons": 6,
-        }
-        away.evaluate.return_value = {
-            "names": ["Dan"], "odds": ["1", "2", "2,5"], "buttons": 3,
-        }
-        buttons, players = parser.extract_wina_players(tableaux)
-        self.assertEqual(home.evaluate.call_count + away.evaluate.call_count, 2)
-        self.assertEqual([p["Cote"] for p in players], [3.5, 4.0, 2.5])
-        self.assertEqual([p["home"] for p in players], [1, 1, 0])
-        self.assertEqual(set(buttons), {"Alice", "Bob", "Dan"})
-        self.assertEqual([c.args[0] for c in home.locator.return_value.nth.call_args_list], [2, 5])
 
-    def test_changed_dom_shape_fails_explicitly(self):
-        tableaux = MagicMock()
-        tableaux.count.return_value = 1
-        tableaux.nth.return_value.locator.return_value.evaluate.return_value = {
-            "names": ["Alice"], "odds": ["1"], "buttons": 1,
-        }
-        with self.assertRaisesRegex(ValueError, "Structure Winamax"):
-            parser.extract_wina_players(tableaux)
-
-    def test_unavailable_odds_keep_identity_without_exposing_a_clickable_button(self):
-        tableaux = MagicMock()
-        tableaux.count.return_value = 1
-        tableaux.nth.return_value.locator.return_value.evaluate.return_value = {
-            "names": ["Erwan Colas"], "odds": ["1", "2", "-"], "buttons": 3,
-        }
-        with self.assertLogs(level="DEBUG") as logs:
-            buttons, players = parser.extract_wina_players(tableaux)
-        self.assertEqual(buttons, {})
-        self.assertEqual(players[0]["Nom"], "Erwan Colas")
-        self.assertTrue(pd.isna(players[0]["Cote"]))
-        self.assertTrue(all(line.startswith("DEBUG:") for line in logs.output))
-
+class PipelineTests(unittest.TestCase):
     def test_browser_closes_on_failure(self):
         with patch.object(parser, "sync_playwright") as playwright:
             browser = playwright.return_value.__enter__.return_value.chromium.launch.return_value
@@ -459,16 +428,17 @@ class BrowserTests(unittest.TestCase):
     def test_pipeline_keeps_unmatched_pmu_combos_and_passes_session(self):
         session = MagicMock()
         with patch.object(parser, "wina_page") as browser, \
-                patch.object(parser, "extract_wina_players", return_value=({}, [])), \
+                patch.object(parser, "WinamaxMyMatch", return_value=wina_market([])) as market, \
                 patch.object(parser, "get_pmu_combi_odds", return_value=6.5) as quote, \
                 patch.object(parser.time, "sleep"):
-            page = browser.return_value.__enter__.return_value
-            section = page.locator.return_value.filter.return_value.filter.return_value.last
-            section.locator.return_value.count.return_value = 0
             pmu, wina = parser.run_master_wina_and_pmu(
                 "https://example.test", 123, players_frame(), [2, 3],
                 4, 1.15, pmu_session=session,
             )
+        page = browser.return_value.__enter__.return_value
+        market.assert_called_once_with(page, "https://example.test")
+        market.return_value.open.assert_called_once()
+        market.return_value.quote.assert_not_called()
         self.assertEqual(len(pmu), 7)
         self.assertEqual(pmu.iloc[-1]["Joueurs"], "Dan - Eve")
         self.assertEqual(pmu.iloc[-1]["Cote PMU"], 6.5)
@@ -479,210 +449,29 @@ class BrowserTests(unittest.TestCase):
         quote.assert_any_call(123, ["4", "5"], session=session, match_name="Home - Away")
         session.close.assert_not_called()
 
-
-class LocalDomTests(unittest.TestCase):
-    """Necessite Chromium Playwright ; aucune connexion aux bookmakers."""
-
-    def test_expands_both_teams_including_offscreen_liverpool(self):
-        with parser.wina_page(True) as page:
-            page.set_content("""
-                <div class="team">
-                    <div class="bet-group-template">
-                        <div><span class="label-line">LASK 1</span></div>
-                    </div>
-                    <button onclick="expand(this, 'LASK')">Plus de s\u00e9lections</button>
-                </div>
-                <div style="height:2500px"></div>
-                <div class="team">
-                    <div class="bet-group-template">
-                        <div><span class="label-line">Barcola</span></div>
-                        <div><span class="label-line">Koumas</span></div>
-                    </div>
-                    <button onclick="expand(this, 'Liverpool')">Plus de s\u00e9lections</button>
-                </div>
-                <script>
-                    function expand(button, team) {
-                        setTimeout(() => {
-                            const group = button.parentElement.querySelector('.bet-group-template');
-                            for (let i = 0; i < 10; i++) {
-                                const row = document.createElement('div');
-                                row.innerHTML = '<span class="label-line">' + team + i + '</span>';
-                                group.appendChild(row);
-                            }
-                            button.remove();
-                        }, 150);
-                    }
-                </script>
-            """)
-            groups = page.locator(".bet-group-template")
-            parser.expand_wina_team(groups.nth(0), 0)
-            parser.expand_wina_team(groups.nth(1), 1)
-            self.assertEqual(groups.nth(0).locator(".label-line").count(), 11)
-            self.assertEqual(groups.nth(1).locator(".label-line").count(), 12)
-            self.assertEqual(page.get_by_text("Plus de s\u00e9lections", exact=True).count(), 0)
-
-    def test_clear_accepts_empty_basket_even_when_odds_stay_visible(self):
-        with parser.wina_page(True) as page:
-            page.set_content("""
-                <div data-testid="sticky-wrap">
-                    <svg viewBox="0 0 20 20" onclick="throw Error('wrong control')"></svg>
-                    <div role="button" aria-label="Effacer et continuer"
-                         onclick="document.querySelector('#empty').hidden=false">Vider</div>
-                    <div class="odds-indicator-value"><div>6,50</div></div>
-                    <div id="empty" hidden>Ton panier est vide !</div>
-                </div>
-            """)
-            parser.clear_wina_basket(page)
-            self.assertTrue(page.locator(".odds-indicator-value").is_visible())
-            self.assertTrue(page.get_by_text("Ton panier est vide !", exact=True).is_visible())
-            parser.clear_wina_basket(page)
-
-    def test_quote_reads_final_value_not_animation_history(self):
-        with parser.wina_page(True) as page:
-            page.set_content("""
-                <button id="alice" onclick="add('Alice')">Alice</button>
-                <button id="bob" onclick="add('Bob')">Bob</button>
-                <div data-testid="sticky-wrap">
-                  <div data-testid="basket-item-match" hidden>
-                    <div class="odds-indicator-value">
-                        <span><span>0,26</span><span>0,52</span><span>6,50</span></span>
-                        <div>6,50</div>
-                    </div>
-                    <div id="players"></div>
-                  </div>
-                    <div role="button" aria-label="Effacer et continuer"
-                         onclick="document.querySelector('#empty').hidden=false">Vider</div>
-                    <div id="empty">Ton panier est vide !</div>
-                </div>
-                <script>
-                  function add(name) {
-                    document.querySelector('#empty').hidden=true;
-                    document.querySelector('[data-testid="basket-item-match"]').hidden=false;
-                    const row=document.createElement('div');
-                    row.innerHTML='<span>Joueur décisif</span><span> '+name+'</span>';
-                    document.querySelector('#players').append(row);
-                  }
-                </script>
-            """)
-            with patch.object(parser, "extract_wina_players", return_value=(
-                {"Alice": page.locator("#alice"), "Bob": page.locator("#bob")}, [],
-            )):
-                self.assertEqual(parser.read_wina_combination(page, None, ["Alice", "Bob"]), 6.5)
-
-    def test_quote_waits_for_delayed_duo_and_trio_instead_of_reading_single(self):
-        for names in (["Alice", "Bob"], ["Alice", "Bob", "Chris"]):
-            with self.subTest(names=names), parser.wina_page(True) as page:
-                page.set_content("""
-                    <button id="Alice" onclick="add('Alice')">Alice</button>
-                    <button id="Bob" onclick="add('Bob')">Bob</button>
-                    <button id="Chris" onclick="add('Chris')">Chris</button>
-                    <div data-testid="sticky-wrap">
-                      <div id="empty">Ton panier est vide !</div>
-                      <div data-testid="basket-item-match" hidden>
-                        <div id="players"></div>
-                        <div class="odds-indicator-value"><div>3,20</div></div>
-                      </div>
-                      <div role="button" aria-label="Effacer et continuer"
-                        onclick="document.querySelector('#empty').hidden=false">Vider</div>
-                    </div>
-                    <script>
-                      let timer;
-                      function add(name) {
-                        clearTimeout(timer);
-                        document.querySelector('#empty').hidden=true;
-                        document.querySelector('[data-testid="basket-item-match"]').hidden=false;
-                        setTimeout(() => {
-                          const row=document.createElement('div');
-                          row.innerHTML='<span>Joueur décisif</span><span> '+name+'</span>';
-                          document.querySelector('#players').append(row);
-                        }, 200);
-                        timer=setTimeout(() => {
-                          document.querySelector('.odds-indicator-value > div').textContent='9,00';
-                        }, 1000);
-                      }
-                    </script>
-                """)
-                with patch.object(parser, "extract_wina_players", side_effect=lambda _: (
-                    {name: page.locator(f"#{name}") for name in names}, [],
-                )):
-                    self.assertEqual(parser.read_wina_combination(page, None, names), 9.0)
-
-    def test_quote_accepts_basket_padding_but_still_checks_exact_player_names(self):
-        with parser.wina_page(True) as page:
-            page.set_content("""
-                <button id="enzo" onclick="add('Enzo&nbsp;Le Fée')">Enzo</button>
-                <button id="nordi" onclick="add('Nordi Mukiele ')">Nordi</button>
-                <div data-testid="sticky-wrap">
-                  <div id="empty">Ton panier est vide !</div>
-                  <div data-testid="basket-item-match" hidden>
-                    <div id="players"></div>
-                    <div class="odds-indicator-value"><div>9,00</div></div>
-                  </div>
-                  <div role="button" aria-label="Effacer et continuer"
-                    onclick="document.querySelector('#empty').hidden=false">Vider</div>
-                </div>
-                <script>
-                  function add(name) {
-                    document.querySelector('#empty').hidden=true;
-                    document.querySelector('[data-testid="basket-item-match"]').hidden=false;
-                    const row=document.createElement('div');
-                    row.innerHTML='<span>Joueur décisif</span><span>&nbsp;'+name+'</span>';
-                    document.querySelector('#players').append(row);
-                  }
-                </script>
-            """)
-            with patch.object(parser, "extract_wina_players", return_value=(
-                {"Enzo Le Fée": page.locator("#enzo"), "Nordi Mukiele": page.locator("#nordi")}, [],
-            )):
-                self.assertEqual(
-                    parser.read_wina_combination(page, None, ["Enzo Le Fée", "Nordi Mukiele"]), 9.0,
-                )
-
-    def test_incorrect_basket_never_returns_the_visible_single_odds(self):
-        with parser.wina_page(True) as page:
-            page.set_content("""
-                <button id="alice" onclick="add()">Alice</button>
-                <button id="bob">Bob</button>
-                <div data-testid="sticky-wrap">
-                  <div id="empty">Ton panier est vide !</div>
-                  <div data-testid="basket-item-match" hidden>
-                    <div><span>Joueur décisif</span><span> Alice</span></div>
-                    <div class="odds-indicator-value"><div>3,20</div></div>
-                  </div>
-                </div>
-                <script>
-                  function add() {
-                    document.querySelector('#empty').hidden=true;
-                    document.querySelector('[data-testid="basket-item-match"]').hidden=false;
-                  }
-                </script>
-            """)
-            with patch.object(parser, "extract_wina_players", return_value=(
-                {"Alice": page.locator("#alice"), "Bob": page.locator("#bob")}, [],
-            )), self.assertRaises(AssertionError):
-                parser.read_wina_combination(page, None, ["Alice", "Bob"])
-
-    def test_extracts_real_dom_and_targets_decisive_player_buttons(self):
-        teams = []
-        for names in (["Alice", "Bob"], ["Dan"]):
-            rows = []
-            for name in names:
-                odds = "".join(
-                    f'<button class="odd-button-wrapper" id="{name}-{i}">'
-                    f'<span class="odd-button-value">{value}</span></button>'
-                    for i, value in enumerate(["1,2", "2,3", "3,4"])
-                )
-                rows.append(f'<div class="row"><div><span class="label-line">{name}</span></div>{odds}</div>')
-            teams.append('<div class="team"><div class="bet-group-template">'
-                         + "".join(rows) + '</div></div>')
-        with parser.wina_page(True) as page:
-            page.set_content("".join(teams))
-            buttons, players = parser.extract_wina_players(page.locator("div.bet-group-template"))
-            self.assertEqual([p["Nom"] for p in players], ["Alice", "Bob", "Dan"])
-            self.assertEqual([p["Cote"] for p in players], [3.4, 3.4, 3.4])
-            self.assertEqual([p["home"] for p in players], [1, 1, 0])
-            for name, button in buttons.items():
-                self.assertEqual(button.get_attribute("id"), f"{name}-2")
+    def test_combinations_use_winamax_outcome_ids_of_matched_players(self):
+        players = [
+            {"home": 1, "Nom": "ALICE", "Cote": 1.5, "outcome_id": 11},
+            {"home": 1, "Nom": "Bob", "Cote": 2.0, "outcome_id": 12},
+            {"home": 1, "Nom": "Chris", "Cote": float("nan"), "outcome_id": 13},
+        ]
+        market = wina_market(players, [6.0])
+        with patch.object(parser, "wina_page"), \
+                patch.object(parser, "WinamaxMyMatch", return_value=market), \
+                patch.object(parser, "get_pmu_combi_odds", return_value=7.0), \
+                patch.object(parser.time, "sleep"), self.assertLogs(level="WARNING"):
+            pmu, wina = parser.run_master_wina_and_pmu(
+                "url", 123, players_frame().iloc[:3], [2, 3], 10, 1.15, name_match_score=100,
+            )
+        # Chris n'a pas de cote Wina : ses combinaisons restent PMU seules.
+        market.quote.assert_called_once_with([11, 12])
+        self.assertEqual(pmu["Joueurs"].tolist()[3:],
+                         ["Alice - Bob", "Alice - Chris", "Bob - Chris", "Alice - Bob - Chris"])
+        self.assertEqual(wina.to_dict("records"), [
+            {"Taille Combi": 1, "Joueurs": "Alice", "Cote Wina": 1.5},
+            {"Taille Combi": 1, "Joueurs": "Bob", "Cote Wina": 2.0},
+            {"Taille Combi": 2, "Joueurs": "Alice - Bob", "Cote Wina": 6.0},
+        ])
 
 
 class SheetsTests(unittest.TestCase):
@@ -783,6 +572,24 @@ class SheetsTests(unittest.TestCase):
         self.worksheet.format.assert_not_called()
         self.assertNotIn("Heure", self.frame.columns)
 
+    def test_existing_sheets_gain_added_columns_left_to_right(self):
+        frame = self.frame.copy()
+        frame.insert(0, "Compositions", "probables")
+        frame.insert(frame.columns.get_loc("Cote Wina") + 1, "Cote Betclic", 2.5)
+        expected = ["Heure", *frame.columns]
+        for missing in (["Compositions"], ["Compositions", "Cote Betclic"]):
+            with self.subTest(missing=missing), patch.object(parser, "set_with_dataframe"):
+                self.worksheet.reset_mock()
+                self.worksheet.col_values.return_value = ["Heure", "old"]
+                self.worksheet.row_values.return_value = [c for c in expected if c not in missing]
+                parser.export_to_google_sheets(frame, "key.json", "book", "match")
+                self.assertEqual(self.worksheet.insert_cols.call_args_list,
+                                 [call([[name]], col=expected.index(name) + 1) for name in missing])
+        self.worksheet.row_values.return_value = ["Heure", "Autre", *frame.columns]
+        with patch.object(parser, "set_with_dataframe"), self.assertLogs(level="ERROR"), \
+                self.assertRaisesRegex(ValueError, "incompatibles"):
+            parser.export_to_google_sheets(frame, "key.json", "book", "match")
+
     def test_export_failure_propagates(self):
         self.worksheet.col_values.return_value = []
         self.sheet.batch_update.side_effect = RuntimeError("quota")
@@ -823,9 +630,10 @@ class SheetsTests(unittest.TestCase):
             parser.process_single_match(123, 456, "", args, "key.json", 0)
         frame, credentials, book, match = export.call_args.args
         self.assertEqual(frame.columns.tolist(), [
-            "Match", "Equipe", "Taille Combi", "Joueurs", "Cote PMU", "Cote Wina", "Cote Betclic",
+            "Compositions", "Match", "Equipe", "Taille Combi", "Joueurs", "Cote PMU", "Cote Wina", "Cote Betclic",
             "Ratio (PMU/Wina)", "Ratio (PMU/Betclic)",
         ])
+        self.assertEqual(set(frame["Compositions"]), {"aucune"})
         self.assertEqual(frame["Joueurs"].tolist(), ["Bob", "Alice", "Chris", "Dan", "Eve"])
         self.assertEqual(frame["Ratio (PMU/Wina)"].iloc[:2].tolist(), [1.5, 1.0])
         self.assertTrue(frame["Cote Wina"].iloc[2:].isna().all())
@@ -844,7 +652,7 @@ class SheetsTests(unittest.TestCase):
                 with patch.object(parser, "GSHEET_NAME", "book", create=True), \
                         patch.object(parser, "get_pmu_players_dict", return_value=players_frame()), \
                         patch.object(parser, "run_master_wina_and_pmu", side_effect=run_wina) as run, \
-                        patch.object(parser, "get_match_lineups", return_value="lineups") as get_lineups, \
+                        patch.object(parser, "get_match_lineups", return_value=Lineups("probables")) as get_lineups, \
                         patch.object(parser, "filter_players",
                                      return_value=players_frame().iloc[[0, 4]]) as filter_lineups, \
                         patch.object(parser, "export_to_google_sheets"):

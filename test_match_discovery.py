@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pandas as pd
 
+from flashscore_lineups import Lineups
 import match_discovery as discovery
 import master_odds_parser as parser
 
@@ -73,13 +74,23 @@ class SelectionTests(unittest.TestCase):
             discovery.local_start("2026-10-15T21:00:00")
 
     def test_betclic_relative_numeric_and_french_dates(self):
-        now = datetime(2026, 10, 15, tzinfo=discovery.PARIS)
+        now = datetime(2026, 10, 15, 12, tzinfo=discovery.PARIS)
         for label, expected in (("Aujourd'hui", DAY), ("Demain", date(2026, 10, 16)),
                                 ("Sam. 17/10", date(2026, 10, 17)),
                                 ("samedi 17 octobre", date(2026, 10, 17))):
             self.assertEqual(discovery.betclic_date(label, now), expected)
         with self.assertRaisesRegex(ValueError, "non reconnue"):
             discovery.betclic_date("Plus tard", now)
+
+    def test_betclic_relative_labels_follow_the_utc_day_after_midnight(self):
+        # Releve du 21/10/2026 a 00h05 (Paris) : les matchs du soir sous "Demain".
+        for now, expected in ((datetime(2026, 10, 21, 0, 5, tzinfo=discovery.PARIS), "Demain"),
+                              (datetime(2026, 10, 21, 2, 5, tzinfo=discovery.PARIS), "Aujourd'hui"),
+                              (datetime(2026, 12, 2, 0, 30, tzinfo=discovery.PARIS), "Demain")):
+            with self.subTest(now=now):
+                self.assertEqual(discovery.betclic_date(expected, now), now.date())
+        self.assertEqual(discovery.betclic_date(
+            "Mer. 21/10", datetime(2026, 10, 21, 0, 5, tzinfo=discovery.PARIS)), date(2026, 10, 21))
 
 
 class AdapterTests(unittest.TestCase):
@@ -287,7 +298,7 @@ class ManualAndPipelineTests(unittest.TestCase):
              "Taille Combi": 1, "Joueurs": name, "Cote PMU": 2.0}
             for home, team, name in ((1, "PSG", "Alice"), (0, "Marseille", "Bob"))
         ])
-        for lineups in (None, {1: [], 0: []}):
+        for lineups in (None, Lineups("officielles", {1: [], 0: []})):
             with self.subTest(lineups=lineups), \
                     patch.object(parser, "datetime") as clock, \
                     patch.object(parser, "get_pmu_players_dict", return_value=frame), \
@@ -323,7 +334,7 @@ class ManualAndPipelineTests(unittest.TestCase):
         frame = pd.DataFrame([{"Match": "PSG - Marseille", "home": 1}])
         with patch.object(parser, "datetime") as clock, \
                 patch.object(parser, "get_pmu_players_dict", return_value=frame), \
-                patch.object(parser, "get_match_lineups", return_value={1: [], 0: []}), \
+                patch.object(parser, "get_match_lineups", return_value=Lineups("officielles", {1: [], 0: []})), \
                 patch.object(parser, "filter_players", return_value=frame), \
                 patch.object(parser, "run_master_wina_and_pmu") as wina, \
                 patch.object(parser, "export_to_google_sheets") as export:
@@ -397,7 +408,7 @@ class ManualAndPipelineTests(unittest.TestCase):
              "Taille Combi": 1, "Joueurs": name, "Cote PMU": 2.0}
             for home, team, name in ((1, "PSG", "Alice"), (0, "Marseille", "Bob"))
         ])
-        for lineups in (None, {1: [], 0: []}):
+        for lineups in (None, Lineups("officielles", {1: [], 0: []})):
             with self.subTest(lineups=lineups), \
                     patch.object(parser, "get_pmu_players_dict", return_value=frame), \
                     patch.object(parser, "get_match_lineups", return_value=lineups) as get_lineups, \
